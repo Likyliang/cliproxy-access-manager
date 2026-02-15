@@ -1,0 +1,38 @@
+FROM golang:1.24-alpine AS builder
+
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG ALL_PROXY
+ARG NO_PROXY
+ARG GOLANG_PROXY=https://proxy.golang.org,direct
+ENV HTTP_PROXY=${HTTP_PROXY} \
+    HTTPS_PROXY=${HTTPS_PROXY} \
+    ALL_PROXY=${ALL_PROXY} \
+    NO_PROXY=${NO_PROXY} \
+    GOPROXY=${GOLANG_PROXY}
+
+WORKDIR /src
+
+COPY go.mod go.sum* ./
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
+
+COPY . .
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o /out/cliproxy-access-manager ./cmd/manager
+
+FROM alpine:3.21
+
+RUN adduser -D -H -s /sbin/nologin appuser && \
+    mkdir -p /data && chown -R appuser:appuser /data
+
+WORKDIR /app
+COPY --from=builder /out/cliproxy-access-manager /app/cliproxy-access-manager
+
+USER appuser
+
+EXPOSE 8390
+VOLUME ["/data"]
+
+ENTRYPOINT ["/app/cliproxy-access-manager"]

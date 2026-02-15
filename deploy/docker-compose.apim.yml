@@ -1,0 +1,47 @@
+# Usage:
+#   cd plugins/cliproxy-access-manager/deploy
+#   cp ../.env.example .env
+#   mkdir -p data
+#   docker compose -f docker-compose.apim.yml up -d --build
+services:
+  cliproxy-access-manager:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.apim
+      args:
+        HTTP_PROXY: ${HTTP_PROXY:-}
+        HTTPS_PROXY: ${HTTPS_PROXY:-}
+        ALL_PROXY: ${ALL_PROXY:-}
+        NO_PROXY: ${NO_PROXY:-127.0.0.1,localhost,host.docker.internal}
+        GOLANG_PROXY: ${GOLANG_PROXY:-https://proxy.golang.org,direct}
+    image: cliproxy-access-manager:latest
+    container_name: cliproxy-access-manager
+    restart: unless-stopped
+    environment:
+      # Runtime settings
+      CLIPROXY_MGMT_BASE_URL: ${CLIPROXY_MGMT_BASE_URL:-http://host.docker.internal:8317}
+      CLIPROXY_MGMT_KEY: ${CLIPROXY_MGMT_KEY:?set CLIPROXY_MGMT_KEY}
+      APIM_HTTP_ADDR: ${APIM_HTTP_ADDR:-0.0.0.0:8390}
+      APIM_HTTP_AUTH_TOKEN: ${APIM_HTTP_AUTH_TOKEN:-}
+      APIM_DATA_DIR: /data
+      APIM_DB_PATH: /data/apim.db
+      APIM_KEY_SYNC_INTERVAL: ${APIM_KEY_SYNC_INTERVAL:-30s}
+      APIM_USAGE_SYNC_INTERVAL: ${APIM_USAGE_SYNC_INTERVAL:-2m}
+      APIM_RECOVERY_CHECK_INTERVAL: ${APIM_RECOVERY_CHECK_INTERVAL:-60s}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_ALLOWED_CHAT_IDS: ${TELEGRAM_ALLOWED_CHAT_IDS:-}
+      TELEGRAM_ALLOWED_USER_IDS: ${TELEGRAM_ALLOWED_USER_IDS:-}
+      TELEGRAM_POLL_INTERVAL: ${TELEGRAM_POLL_INTERVAL:-3s}
+
+      # Build/runtime proxy (user-provided):
+      # HTTP proxy  : http://127.0.0.1:20171
+      # SOCKS5 proxy: socks5://127.0.0.1:20170
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      NO_PROXY: ${NO_PROXY:-127.0.0.1,localhost,host.docker.internal}
+    volumes:
+      - ./data:/data
+    ports:
+      - "127.0.0.1:8390:8390"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
