@@ -107,14 +107,36 @@ When building inside Docker, use host-reachable proxy endpoints (for many Linux 
 
 ## Docker
 
-The compose file expects this repository as project root:
+### Option A: production deploy (recommended, pull image)
 
 ```bash
 cd deploy
 cp .env.production.example .env
 mkdir -p data
 
-# choose one proxy mode when needed:
+# optional proxy for runtime
+# export HTTP_PROXY=http://127.0.0.1:20171
+# export HTTPS_PROXY=http://127.0.0.1:20171
+# export ALL_PROXY=socks5://127.0.0.1:20170
+
+docker compose -f docker-compose.deploy.yml up -d
+```
+
+Notes:
+- Uses image from `APIM_IMAGE` (default: `moocher4097/cliproxy-access-manager:latest`).
+- Telegram is optional. Configure in `.env`:
+  - `TELEGRAM_BOT_TOKEN`
+  - `TELEGRAM_ALLOWED_CHAT_IDS`
+  - `TELEGRAM_ALLOWED_USER_IDS`
+
+### Option B: build locally with Compose
+
+```bash
+cd deploy
+cp .env.production.example .env
+mkdir -p data
+
+# choose one proxy mode when needed for build:
 # HTTP proxy mode
 export HTTP_PROXY=http://127.0.0.1:20171
 export HTTPS_PROXY=http://127.0.0.1:20171
@@ -128,7 +150,7 @@ export GOLANG_PROXY=https://proxy.golang.org,direct
 docker compose -f docker-compose.apim.yml up -d --build
 ```
 
-Use `deploy/docker-compose.apim.yml` with `deploy/.env.production.example` as the recommended production template.
+Use `deploy/.env.production.example` as the recommended production template.
 
 ## systemd
 

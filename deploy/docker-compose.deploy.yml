@@ -1,0 +1,54 @@
+# Production deployment template (pull prebuilt image)
+#
+# Usage:
+#   cd deploy
+#   cp .env.production.example .env
+#   mkdir -p data
+#   docker compose -f docker-compose.deploy.yml up -d
+#
+# Optional Telegram setup in .env:
+#   TELEGRAM_BOT_TOKEN=<your_bot_token>
+#   TELEGRAM_ALLOWED_CHAT_IDS=<chat_id1,chat_id2>
+#   TELEGRAM_ALLOWED_USER_IDS=<user_id1,user_id2>
+
+services:
+  cliproxy-access-manager:
+    image: ${APIM_IMAGE:-moocher4097/cliproxy-access-manager:latest}
+    container_name: cliproxy-access-manager
+    restart: unless-stopped
+    environment:
+      CLIPROXY_MGMT_BASE_URL: ${CLIPROXY_MGMT_BASE_URL:?set CLIPROXY_MGMT_BASE_URL}
+      CLIPROXY_MGMT_KEY: ${CLIPROXY_MGMT_KEY:?set CLIPROXY_MGMT_KEY}
+      APIM_HTTP_ADDR: ${APIM_HTTP_ADDR:-0.0.0.0:8390}
+      APIM_HTTP_AUTH_TOKEN: ${APIM_HTTP_AUTH_TOKEN:?set APIM_HTTP_AUTH_TOKEN}
+      APIM_DATA_DIR: /data
+      APIM_DB_PATH: /data/apim.db
+      APIM_KEY_SYNC_INTERVAL: ${APIM_KEY_SYNC_INTERVAL:-30s}
+      APIM_USAGE_SYNC_INTERVAL: ${APIM_USAGE_SYNC_INTERVAL:-2m}
+      APIM_RECOVERY_CHECK_INTERVAL: ${APIM_RECOVERY_CHECK_INTERVAL:-60s}
+      APIM_INSECURE_SKIP_TLS_VERIFY: ${APIM_INSECURE_SKIP_TLS_VERIFY:-false}
+      APIM_LOG_LEVEL: ${APIM_LOG_LEVEL:-info}
+
+      # Telegram (optional; leave empty to disable)
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_ALLOWED_CHAT_IDS: ${TELEGRAM_ALLOWED_CHAT_IDS:-}
+      TELEGRAM_ALLOWED_USER_IDS: ${TELEGRAM_ALLOWED_USER_IDS:-}
+      TELEGRAM_POLL_INTERVAL: ${TELEGRAM_POLL_INTERVAL:-3s}
+
+      # Proxy (optional)
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      ALL_PROXY: ${ALL_PROXY:-}
+      NO_PROXY: ${NO_PROXY:-127.0.0.1,localhost,host.docker.internal}
+    volumes:
+      - ./data:/data
+    ports:
+      - "127.0.0.1:8390:8390"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8390/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
