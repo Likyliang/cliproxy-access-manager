@@ -91,7 +91,6 @@ or
 ## Build (local Go)
 
 ```bash
-cd plugins/cliproxy-access-manager
 go mod tidy
 go build ./cmd/manager
 ```
@@ -108,14 +107,14 @@ When building inside Docker, use host-reachable proxy endpoints (for many Linux 
 
 ## Docker
 
-The compose file expects this folder as project root:
+The compose file expects this repository as project root:
 
 ```bash
-cd plugins/cliproxy-access-manager/deploy
-cp ../.env.example .env
+cd deploy
+cp .env.production.example .env
 mkdir -p data
 
-# choose one proxy mode:
+# choose one proxy mode when needed:
 # HTTP proxy mode
 export HTTP_PROXY=http://127.0.0.1:20171
 export HTTPS_PROXY=http://127.0.0.1:20171
@@ -129,7 +128,7 @@ export GOLANG_PROXY=https://proxy.golang.org,direct
 docker compose -f docker-compose.apim.yml up -d --build
 ```
 
-Use `deploy/docker-compose.apim.yml`.
+Use `deploy/docker-compose.apim.yml` with `deploy/.env.production.example` as the recommended production template.
 
 ## systemd
 
