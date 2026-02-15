@@ -46,7 +46,6 @@ func main() {
 		cfg.RecoveryInterval,
 		cfg.UpdateCheckEnabled,
 		cfg.UpdateCheckTime,
-		cfg.ManagementCurrentVersion,
 		cfg.ManagementLatestVersionURL,
 		cfg.UpdateApplyCommand,
 	)

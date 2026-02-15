@@ -500,6 +500,9 @@ func (b *Bot) executeCommand(ctx context.Context, text string, chatID, userID in
 		if strings.TrimSpace(status.UpdateCheckTime) != "" {
 			lines = append(lines, "daily_update_check_utc="+status.UpdateCheckTime)
 		}
+		if strings.TrimSpace(status.UpdateApplyMode) != "" {
+			lines = append(lines, "update_apply_mode="+status.UpdateApplyMode)
+		}
 		if status.UpdateCommandSet {
 			lines = append(lines, "update_apply_command=configured")
 		} else {

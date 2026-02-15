@@ -2,10 +2,11 @@ package reconcile
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -22,11 +23,14 @@ type Manager struct {
 	usageSyncInterval     time.Duration
 	recoveryCheckInterval time.Duration
 
-	updateCheckEnabled       bool
-	updateCheckTime          string
-	managementCurrentVersion string
-	latestVersionEndpoint    string
-	updateApplyCommand       string
+	updateCheckEnabled    bool
+	updateCheckTime       string
+	latestVersionEndpoint string
+	updateApplyCommand    string
+	autoUpdateEnabled     bool
+	autoUpdateService     string
+	autoUpdateComposeFile string
+	autoUpdateWorkingDir  string
 
 	updateMu sync.Mutex
 	wg       sync.WaitGroup
@@ -46,23 +50,25 @@ type Status struct {
 	UpdateStatus         string     `json:"update_status,omitempty"`
 	UpdateMessage        string     `json:"update_message,omitempty"`
 	UpdateCheckTime      string     `json:"update_check_time,omitempty"`
+	UpdateApplyMode      string     `json:"update_apply_mode,omitempty"`
 	UpdateCommandSet     bool       `json:"update_command_set"`
 	Message              string     `json:"message,omitempty"`
 }
 
-func NewManager(s *store.Store, c *cliproxy.Client, keySyncInterval, usageSyncInterval, recoveryCheckInterval time.Duration, updateCheckEnabled bool, updateCheckTime, currentVersion, latestVersionEndpoint, updateApplyCommand string) *Manager {
-	return &Manager{
-		store:                    s,
-		client:                   c,
-		keySyncInterval:          keySyncInterval,
-		usageSyncInterval:        usageSyncInterval,
-		recoveryCheckInterval:    recoveryCheckInterval,
-		updateCheckEnabled:       updateCheckEnabled,
-		updateCheckTime:          strings.TrimSpace(updateCheckTime),
-		managementCurrentVersion: strings.TrimSpace(currentVersion),
-		latestVersionEndpoint:    strings.TrimSpace(latestVersionEndpoint),
-		updateApplyCommand:       strings.TrimSpace(updateApplyCommand),
+func NewManager(s *store.Store, c *cliproxy.Client, keySyncInterval, usageSyncInterval, recoveryCheckInterval time.Duration, updateCheckEnabled bool, updateCheckTime, latestVersionEndpoint, updateApplyCommand string) *Manager {
+	m := &Manager{
+		store:                 s,
+		client:                c,
+		keySyncInterval:       keySyncInterval,
+		usageSyncInterval:     usageSyncInterval,
+		recoveryCheckInterval: recoveryCheckInterval,
+		updateCheckEnabled:    updateCheckEnabled,
+		updateCheckTime:       strings.TrimSpace(updateCheckTime),
+		latestVersionEndpoint: strings.TrimSpace(latestVersionEndpoint),
+		updateApplyCommand:    strings.TrimSpace(updateApplyCommand),
 	}
+	m.initAutoUpdateConfig()
+	return m
 }
 
 func (m *Manager) Start(ctx context.Context) {
@@ -311,22 +317,23 @@ func (m *Manager) CheckMainProjectUpdateNow(ctx context.Context) error {
 	if m == nil {
 		return fmt.Errorf("nil manager")
 	}
-	latest, err := m.client.GetLatestVersion(ctx, m.latestVersionEndpoint)
+	latest, current, err := m.client.GetLatestVersion(ctx, m.latestVersionEndpoint)
 	checkedAt := time.Now().UTC()
 	if err != nil {
-		_ = m.store.UpdateSyncStateUpdateCheck(ctx, &checkedAt, m.managementCurrentVersion, "", "check_failed", err.Error(), &checkedAt)
+		_ = m.store.UpdateSyncStateUpdateCheck(ctx, &checkedAt, "", "", "check_failed", err.Error(), &checkedAt)
 		return err
 	}
+	current = strings.TrimSpace(current)
 	status := "up_to_date"
 	message := "main project is up to date"
-	if strings.TrimSpace(m.managementCurrentVersion) == "" {
+	if current == "" {
 		status = "unknown_current"
-		message = "current version is not configured"
-	} else if latest != strings.TrimSpace(m.managementCurrentVersion) {
+		message = "current version header is missing"
+	} else if latest != current {
 		status = "update_available"
-		message = fmt.Sprintf("new version available: latest=%s current=%s", latest, strings.TrimSpace(m.managementCurrentVersion))
+		message = fmt.Sprintf("new version available: latest=%s current=%s", latest, current)
 	}
-	if err := m.store.UpdateSyncStateUpdateCheck(ctx, &checkedAt, m.managementCurrentVersion, latest, status, message, &checkedAt); err != nil {
+	if err := m.store.UpdateSyncStateUpdateCheck(ctx, &checkedAt, current, latest, status, message, &checkedAt); err != nil {
 		return err
 	}
 	_ = m.store.InsertAuditLog(ctx, "reconciler", "main_project_update_check", message)
@@ -339,34 +346,36 @@ func (m *Manager) ApplyMainProjectUpdateNow(ctx context.Context) error {
 	}
 	m.updateMu.Lock()
 	defer m.updateMu.Unlock()
-	command := strings.TrimSpace(m.updateApplyCommand)
-	if command == "" {
-		return fmt.Errorf("update command is not configured")
-	}
+
 	if err := m.SyncUsageSnapshot(ctx); err != nil {
 		return fmt.Errorf("sync usage snapshot before update: %w", err)
 	}
 	if err := m.RecoverIfNeeded(ctx); err != nil {
 		return fmt.Errorf("recovery pre-check before update: %w", err)
 	}
-	cmd := exec.CommandContext(ctx, "sh", "-lc", command)
-	output, err := cmd.CombinedOutput()
-	result := strings.TrimSpace(string(output))
-	if len(result) > 1200 {
-		result = result[:1200]
+
+	applyDesc := "custom_command"
+	result := ""
+	var applyErr error
+	if command := strings.TrimSpace(m.updateApplyCommand); command != "" {
+		result, applyErr = m.runCustomUpdateCommand(ctx, command)
+	} else {
+		applyDesc = "auto_compose"
+		result, applyErr = m.runAutoComposeUpdate(ctx)
 	}
-	if err != nil {
-		detail := fmt.Sprintf("command failed: %v output=%s", err, result)
+	if applyErr != nil {
+		detail := fmt.Sprintf("%s failed: %v output=%s", applyDesc, applyErr, result)
 		_ = m.store.InsertAuditLog(ctx, "reconciler", "main_project_update_apply_failed", detail)
-		return errors.New(detail)
+		return fmt.Errorf("%s", detail)
 	}
+
 	if err := m.SyncUsageSnapshot(ctx); err != nil {
-		_ = m.store.InsertAuditLog(ctx, "reconciler", "main_project_update_apply_warn", "update command succeeded but usage sync after update failed: "+err.Error())
+		_ = m.store.InsertAuditLog(ctx, "reconciler", "main_project_update_apply_warn", "update apply succeeded but usage sync after update failed: "+err.Error())
 	}
 	if err := m.RecoverIfNeeded(ctx); err != nil {
-		_ = m.store.InsertAuditLog(ctx, "reconciler", "main_project_update_apply_warn", "update command succeeded but recovery after update failed: "+err.Error())
+		_ = m.store.InsertAuditLog(ctx, "reconciler", "main_project_update_apply_warn", "update apply succeeded but recovery after update failed: "+err.Error())
 	}
-	_ = m.store.InsertAuditLog(ctx, "reconciler", "main_project_update_apply", "update command succeeded")
+	_ = m.store.InsertAuditLog(ctx, "reconciler", "main_project_update_apply", applyDesc+" succeeded")
 	return nil
 }
 
@@ -393,10 +402,219 @@ func (m *Manager) Status(ctx context.Context) (Status, error) {
 		UpdateStatus:         state.LastUpdateStatus,
 		UpdateMessage:        state.LastUpdateMessage,
 		UpdateCheckTime:      m.updateCheckTime,
+		UpdateApplyMode:      m.updateApplyMode(),
 		UpdateCommandSet:     strings.TrimSpace(m.updateApplyCommand) != "",
 	}
 	if healthErr != nil {
 		status.Message = healthErr.Error()
 	}
 	return status, nil
+}
+
+func (m *Manager) initAutoUpdateConfig() {
+	m.autoUpdateEnabled = parseBoolEnv(os.Getenv("APIM_AUTO_UPDATE_ENABLED"), true)
+	m.autoUpdateService = strings.TrimSpace(os.Getenv("APIM_AUTO_UPDATE_SERVICE"))
+	if m.autoUpdateService == "" {
+		m.autoUpdateService = "cliproxy"
+	}
+	m.autoUpdateComposeFile = strings.TrimSpace(os.Getenv("APIM_AUTO_UPDATE_COMPOSE_FILE"))
+	m.autoUpdateWorkingDir = strings.TrimSpace(os.Getenv("APIM_AUTO_UPDATE_WORKING_DIR"))
+}
+
+func (m *Manager) updateApplyMode() string {
+	if strings.TrimSpace(m.updateApplyCommand) != "" {
+		return "custom_command"
+	}
+	if m.autoUpdateEnabled {
+		return "auto_compose"
+	}
+	return "disabled"
+}
+
+func (m *Manager) runAutoComposeUpdate(ctx context.Context) (string, error) {
+	if !m.autoUpdateEnabled {
+		return "", fmt.Errorf("update command is not configured and auto compose update is disabled")
+	}
+	composeFile, workingDir, service, err := m.autoComposeTarget()
+	if err != nil {
+		return "", err
+	}
+	pullCmd := exec.CommandContext(ctx, "docker", "compose", "-f", composeFile, "pull", service)
+	pullCmd.Dir = workingDir
+	pullOut, pullErr := pullCmd.CombinedOutput()
+	pullText := trimOutput(pullOut, 600)
+	if pullErr != nil {
+		return pullText, fmt.Errorf("docker compose pull failed: %w", pullErr)
+	}
+
+	upCmd := exec.CommandContext(ctx, "docker", "compose", "-f", composeFile, "up", "-d", service)
+	upCmd.Dir = workingDir
+	upOut, upErr := upCmd.CombinedOutput()
+	upText := trimOutput(upOut, 600)
+	combined := trimOutput([]byte(strings.TrimSpace("pull: "+pullText+"\nup: "+upText)), 1200)
+	if upErr != nil {
+		return combined, fmt.Errorf("docker compose up failed: %w", upErr)
+	}
+	return combined, nil
+}
+
+func (m *Manager) runCustomUpdateCommand(ctx context.Context, command string) (string, error) {
+	cmd := exec.CommandContext(ctx, "sh", "-lc", command)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return trimOutput(output, 1200), err
+	}
+	return trimOutput(output, 1200), nil
+}
+
+func (m *Manager) autoComposeTarget() (composeFile, workingDir, service string, err error) {
+	service = strings.TrimSpace(m.autoUpdateService)
+	if service == "" {
+		service = "cliproxy"
+	}
+	if !isSafeComposeServiceName(service) {
+		return "", "", "", fmt.Errorf("invalid APIM_AUTO_UPDATE_SERVICE")
+	}
+	composeFile, err = m.resolveAutoComposeFile()
+	if err != nil {
+		return "", "", "", err
+	}
+	workingDir = strings.TrimSpace(m.autoUpdateWorkingDir)
+	if workingDir == "" {
+		workingDir = filepath.Dir(composeFile)
+	}
+	if !filepath.IsAbs(workingDir) {
+		if absDir, absErr := filepath.Abs(workingDir); absErr == nil {
+			workingDir = absDir
+		}
+	}
+	if !isDir(workingDir) {
+		return "", "", "", fmt.Errorf("auto update working directory does not exist: %s", workingDir)
+	}
+	return composeFile, workingDir, service, nil
+}
+
+func (m *Manager) resolveAutoComposeFile() (string, error) {
+	if configured := strings.TrimSpace(m.autoUpdateComposeFile); configured != "" {
+		path := configured
+		if !filepath.IsAbs(path) {
+			base := strings.TrimSpace(m.autoUpdateWorkingDir)
+			if base == "" {
+				if cwd, err := os.Getwd(); err == nil {
+					base = cwd
+				}
+			}
+			if base != "" {
+				path = filepath.Join(base, path)
+			}
+		}
+		if !filepath.IsAbs(path) {
+			if absPath, err := filepath.Abs(path); err == nil {
+				path = absPath
+			}
+		}
+		if !isFile(path) {
+			return "", fmt.Errorf("auto update compose file not found: %s", path)
+		}
+		return path, nil
+	}
+
+	candidates := make([]string, 0, 16)
+	seen := make(map[string]struct{}, 16)
+	addCandidate := func(path string) {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			return
+		}
+		if !filepath.IsAbs(path) {
+			if absPath, err := filepath.Abs(path); err == nil {
+				path = absPath
+			}
+		}
+		if _, ok := seen[path]; ok {
+			return
+		}
+		seen[path] = struct{}{}
+		candidates = append(candidates, path)
+	}
+	addComposeNames := func(dir string) {
+		dir = strings.TrimSpace(dir)
+		if dir == "" {
+			return
+		}
+		addCandidate(filepath.Join(dir, "docker-compose.yml"))
+		addCandidate(filepath.Join(dir, "docker-compose.yaml"))
+		addCandidate(filepath.Join(dir, "compose.yml"))
+		addCandidate(filepath.Join(dir, "compose.yaml"))
+	}
+
+	addComposeNames(strings.TrimSpace(m.autoUpdateWorkingDir))
+	if cwd, cwdErr := os.Getwd(); cwdErr == nil {
+		addComposeNames(cwd)
+		addComposeNames(filepath.Dir(cwd))
+	}
+	addComposeNames("/opt/cliproxy")
+
+	for _, candidate := range candidates {
+		if isFile(candidate) {
+			return candidate, nil
+		}
+	}
+	return "", fmt.Errorf("update command is not configured and auto compose file was not found; set APIM_AUTO_UPDATE_COMPOSE_FILE or APIM_UPDATE_APPLY_COMMAND")
+}
+
+func parseBoolEnv(raw string, fallback bool) bool {
+	raw = strings.TrimSpace(strings.ToLower(raw))
+	if raw == "" {
+		return fallback
+	}
+	switch raw {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return fallback
+	}
+}
+
+func isSafeComposeServiceName(raw string) bool {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return false
+	}
+	for _, r := range raw {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' || r == '.' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func isFile(path string) bool {
+	info, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	return !info.IsDir()
+}
+
+func isDir(path string) bool {
+	info, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	return info.IsDir()
+}
+
+func trimOutput(raw []byte, limit int) string {
+	text := strings.TrimSpace(string(raw))
+	if limit <= 0 {
+		return text
+	}
+	if len(text) <= limit {
+		return text
+	}
+	return text[:limit]
 }

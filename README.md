@@ -51,9 +51,13 @@ Telegram (optional):
 Main-project update tracking/control:
 - `APIM_UPDATE_CHECK_ENABLED` (default `true`)
 - `APIM_UPDATE_CHECK_TIME` (default `04:00`, UTC)
-- `APIM_MANAGEMENT_CURRENT_VERSION` (set your current CLIProxyAPI version)
+- current CLIProxyAPI version is auto-detected from management response header `X-CPA-VERSION`
 - `APIM_MANAGEMENT_LATEST_VERSION_URL` (default `/v0/management/latest-version`)
-- `APIM_UPDATE_APPLY_COMMAND` (optional update command, e.g. docker compose pull/up)
+- `APIM_UPDATE_APPLY_COMMAND` (optional; if empty, sidecar uses automatic docker compose update mode)
+- `APIM_AUTO_UPDATE_ENABLED` (default `true`)
+- `APIM_AUTO_UPDATE_SERVICE` (default `cliproxy`)
+- `APIM_AUTO_UPDATE_COMPOSE_FILE` (optional absolute compose file path)
+- `APIM_AUTO_UPDATE_WORKING_DIR` (optional working directory for compose lookup)
 
 ## Telegram commands
 
@@ -142,7 +146,10 @@ Notes:
   - `TELEGRAM_ALLOWED_CHAT_IDS`
   - `TELEGRAM_ALLOWED_USER_IDS`
 - Daily main-project update check runs at `APIM_UPDATE_CHECK_TIME` in UTC (default `04:00`).
-- For dockerized main project updates, set `APIM_UPDATE_APPLY_COMMAND` to a docker compose pull/up command.
+- If `APIM_UPDATE_APPLY_COMMAND` is empty, `/update_apply` will auto-run:
+  - `docker compose -f <compose-file> pull <service>`
+  - `docker compose -f <compose-file> up -d <service>`
+  with defaults `service=cliproxy`, and compose file auto-detected from common paths.
 
 ### Option B: build locally with Compose
 

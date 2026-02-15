@@ -22,7 +22,6 @@ type Config struct {
 	RecoveryInterval           time.Duration
 	UpdateCheckEnabled         bool
 	UpdateCheckTime            string
-	ManagementCurrentVersion   string
 	ManagementLatestVersionURL string
 	UpdateApplyCommand         string
 	TelegramBotToken           string
@@ -45,7 +44,6 @@ func Load() (Config, error) {
 		RecoveryInterval:           envDurationOrDefault("APIM_RECOVERY_CHECK_INTERVAL", 60*time.Second),
 		UpdateCheckEnabled:         envBoolOrDefault("APIM_UPDATE_CHECK_ENABLED", true),
 		UpdateCheckTime:            strings.TrimSpace(envOrDefault("APIM_UPDATE_CHECK_TIME", "04:00")),
-		ManagementCurrentVersion:   strings.TrimSpace(os.Getenv("APIM_MANAGEMENT_CURRENT_VERSION")),
 		ManagementLatestVersionURL: strings.TrimSpace(envOrDefault("APIM_MANAGEMENT_LATEST_VERSION_URL", "/v0/management/latest-version")),
 		UpdateApplyCommand:         strings.TrimSpace(os.Getenv("APIM_UPDATE_APPLY_COMMAND")),
 		TelegramBotToken:           strings.TrimSpace(os.Getenv("TELEGRAM_BOT_TOKEN")),

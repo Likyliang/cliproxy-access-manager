@@ -122,7 +122,7 @@ func (c *Client) ImportUsage(ctx context.Context, exportPayload []byte) error {
 	return nil
 }
 
-func (c *Client) GetLatestVersion(ctx context.Context, endpoint string) (string, error) {
+func (c *Client) GetLatestVersion(ctx context.Context, endpoint string) (string, string, error) {
 	endpoint = strings.TrimSpace(endpoint)
 	if endpoint == "" {
 		endpoint = "/v0/management/latest-version"
@@ -130,28 +130,37 @@ func (c *Client) GetLatestVersion(ctx context.Context, endpoint string) (string,
 	if !strings.HasPrefix(endpoint, "/") {
 		endpoint = "/" + endpoint
 	}
-	body, err := c.doJSON(ctx, http.MethodGet, endpoint, nil)
+	body, headers, err := c.doJSONWithHeaders(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	var resp LatestVersionResponse
 	if err := json.Unmarshal(body, &resp); err != nil {
-		return "", fmt.Errorf("decode latest-version response: %w", err)
+		return "", "", fmt.Errorf("decode latest-version response: %w", err)
 	}
 	latest := strings.TrimSpace(resp.LatestVersion)
 	if latest == "" {
-		return "", fmt.Errorf("missing latest version")
+		return "", "", fmt.Errorf("missing latest version")
 	}
-	return latest, nil
+	current := strings.TrimSpace(headers.Get("X-CPA-VERSION"))
+	return latest, current, nil
 }
 
 func (c *Client) doJSON(ctx context.Context, method, path string, payload []byte) ([]byte, error) {
+	body, _, err := c.doJSONWithHeaders(ctx, method, path, payload)
+	if err != nil {
+		return nil, err
+	}
+	return body, nil
+}
+
+func (c *Client) doJSONWithHeaders(ctx context.Context, method, path string, payload []byte) ([]byte, http.Header, error) {
 	if c == nil {
-		return nil, fmt.Errorf("nil client")
+		return nil, nil, fmt.Errorf("nil client")
 	}
 	path = strings.TrimSpace(path)
 	if path == "" || !strings.HasPrefix(path, "/") {
-		return nil, fmt.Errorf("invalid path")
+		return nil, nil, fmt.Errorf("invalid path")
 	}
 	var bodyReader io.Reader
 	if payload != nil {
@@ -159,7 +168,7 @@ func (c *Client) doJSON(ctx context.Context, method, path string, payload []byte
 	}
 	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, bodyReader)
 	if err != nil {
-		return nil, fmt.Errorf("build request: %w", err)
+		return nil, nil, fmt.Errorf("build request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+c.key)
 	req.Header.Set("Accept", "application/json")
@@ -169,20 +178,20 @@ func (c *Client) doJSON(ctx context.Context, method, path string, payload []byte
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("execute request: %w", err)
+		return nil, nil, fmt.Errorf("execute request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("read response: %w", err)
+		return nil, nil, fmt.Errorf("read response: %w", err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		msg := strings.TrimSpace(string(body))
 		if msg == "" {
 			msg = resp.Status
 		}
-		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, msg)
+		return nil, nil, fmt.Errorf("status %d: %s", resp.StatusCode, msg)
 	}
-	return body, nil
+	return body, resp.Header.Clone(), nil
 }
