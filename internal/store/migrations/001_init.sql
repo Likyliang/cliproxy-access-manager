@@ -31,6 +31,11 @@ CREATE TABLE IF NOT EXISTS sync_state (
     last_usage_snapshot_at DATETIME NULL,
     last_recover_import_hash TEXT NOT NULL DEFAULT '',
     last_recover_import_at DATETIME NULL,
+    last_update_check_at DATETIME NULL,
+    last_known_latest TEXT NOT NULL DEFAULT '',
+    last_known_current TEXT NOT NULL DEFAULT '',
+    last_update_status TEXT NOT NULL DEFAULT '',
+    last_update_message TEXT NOT NULL DEFAULT '',
     updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 

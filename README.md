@@ -48,6 +48,13 @@ Telegram (optional):
 - `TELEGRAM_ALLOWED_USER_IDS` (comma-separated int64)
 - `TELEGRAM_POLL_INTERVAL` (default `3s`)
 
+Main-project update tracking/control:
+- `APIM_UPDATE_CHECK_ENABLED` (default `true`)
+- `APIM_UPDATE_CHECK_TIME` (default `04:00`, UTC)
+- `APIM_MANAGEMENT_CURRENT_VERSION` (set your current CLIProxyAPI version)
+- `APIM_MANAGEMENT_LATEST_VERSION_URL` (default `/v0/management/latest-version`)
+- `APIM_UPDATE_APPLY_COMMAND` (optional update command, e.g. docker compose pull/up)
+
 ## Telegram commands
 
 - `/help`
@@ -60,7 +67,10 @@ Telegram (optional):
 - `/me <email> [24h|7d|duration]`
 - `/recharge <email> [plan_or_note]` (placeholder)
 - `/sync_now`
+- `/usage_sync_now`
 - `/status`
+- `/update_check`
+- `/update_apply`
 
 TTL examples:
 - `24h`
@@ -73,6 +83,9 @@ TTL examples:
 - `GET /healthz`
 - `GET /status`
 - `POST /sync_now`
+- `POST /usage/sync_now`
+- `POST /update/check`
+- `POST /update/apply`
 - `GET /keys?filter=all|active|expired`
 - `POST /keys` (supports `owner_email`)
 - `DELETE /keys?key=<api-key>`
@@ -128,6 +141,8 @@ Notes:
   - `TELEGRAM_BOT_TOKEN`
   - `TELEGRAM_ALLOWED_CHAT_IDS`
   - `TELEGRAM_ALLOWED_USER_IDS`
+- Daily main-project update check runs at `APIM_UPDATE_CHECK_TIME` in UTC (default `04:00`).
+- For dockerized main project updates, set `APIM_UPDATE_APPLY_COMMAND` to a docker compose pull/up command.
 
 ### Option B: build locally with Compose
 

@@ -74,8 +74,18 @@ func (s *Store) migrate(ctx context.Context) error {
 			last_usage_snapshot_at DATETIME NULL,
 			last_recover_import_hash TEXT NOT NULL DEFAULT '',
 			last_recover_import_at DATETIME NULL,
+			last_update_check_at DATETIME NULL,
+			last_known_latest TEXT NOT NULL DEFAULT '',
+			last_known_current TEXT NOT NULL DEFAULT '',
+			last_update_status TEXT NOT NULL DEFAULT '',
+			last_update_message TEXT NOT NULL DEFAULT '',
 			updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 		);`,
+		`ALTER TABLE sync_state ADD COLUMN last_update_check_at DATETIME NULL;`,
+		`ALTER TABLE sync_state ADD COLUMN last_known_latest TEXT NOT NULL DEFAULT '';`,
+		`ALTER TABLE sync_state ADD COLUMN last_known_current TEXT NOT NULL DEFAULT '';`,
+		`ALTER TABLE sync_state ADD COLUMN last_update_status TEXT NOT NULL DEFAULT '';`,
+		`ALTER TABLE sync_state ADD COLUMN last_update_message TEXT NOT NULL DEFAULT '';`,
 		`INSERT INTO sync_state(id) VALUES (1) ON CONFLICT(id) DO NOTHING;`,
 		`CREATE TABLE IF NOT EXISTS audit_logs (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -87,7 +97,9 @@ func (s *Store) migrate(ctx context.Context) error {
 	}
 	for _, query := range queries {
 		if _, err := s.db.ExecContext(ctx, query); err != nil {
-			if strings.Contains(strings.ToLower(err.Error()), "duplicate column name") && strings.Contains(strings.ToLower(query), "alter table api_keys add column owner_email") {
+			lowerErr := strings.ToLower(err.Error())
+			lowerQuery := strings.ToLower(query)
+			if strings.Contains(lowerErr, "duplicate column name") && (strings.Contains(lowerQuery, "alter table api_keys add column owner_email") || strings.Contains(lowerQuery, "alter table sync_state add column")) {
 				continue
 			}
 			return fmt.Errorf("migrate query failed: %w", err)
@@ -355,11 +367,13 @@ func (s *Store) GetSyncState(ctx context.Context) (SyncState, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, last_applied_keys_hash, last_applied_at,
 		       last_usage_snapshot_hash, last_usage_snapshot_at,
-		       last_recover_import_hash, last_recover_import_at, updated_at
+		       last_recover_import_hash, last_recover_import_at,
+		       last_update_check_at, last_known_latest, last_known_current,
+		       last_update_status, last_update_message, updated_at
 		FROM sync_state WHERE id = 1
 	`)
 	var item SyncState
-	var lastApplied, lastSnapshot, lastRecover sql.NullTime
+	var lastApplied, lastSnapshot, lastRecover, lastUpdateCheck sql.NullTime
 	if err := row.Scan(
 		&item.ID,
 		&item.LastAppliedKeysHash,
@@ -368,6 +382,11 @@ func (s *Store) GetSyncState(ctx context.Context) (SyncState, error) {
 		&lastSnapshot,
 		&item.LastRecoverImportHash,
 		&lastRecover,
+		&lastUpdateCheck,
+		&item.LastKnownLatest,
+		&item.LastKnownCurrent,
+		&item.LastUpdateStatus,
+		&item.LastUpdateMessage,
 		&item.UpdatedAt,
 	); err != nil {
 		return SyncState{}, fmt.Errorf("get sync state: %w", err)
@@ -383,6 +402,10 @@ func (s *Store) GetSyncState(ctx context.Context) (SyncState, error) {
 	if lastRecover.Valid {
 		t := lastRecover.Time.UTC()
 		item.LastRecoverImportAt = &t
+	}
+	if lastUpdateCheck.Valid {
+		t := lastUpdateCheck.Time.UTC()
+		item.LastUpdateCheckAt = &t
 	}
 	item.UpdatedAt = item.UpdatedAt.UTC()
 	return item, nil
@@ -455,6 +478,27 @@ func (s *Store) TouchSyncStateRecoveryHash(ctx context.Context, hash string, upd
 	`, strings.TrimSpace(hash), updatedAt.UTC())
 	if err != nil {
 		return fmt.Errorf("touch sync state recovery hash: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) UpdateSyncStateUpdateCheck(ctx context.Context, checkedAt *time.Time, current, latest, status, message string, updatedAt *time.Time) error {
+	if updatedAt == nil {
+		now := time.Now().UTC()
+		updatedAt = &now
+	}
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE sync_state
+		SET last_update_check_at = ?,
+		    last_known_current = ?,
+		    last_known_latest = ?,
+		    last_update_status = ?,
+		    last_update_message = ?,
+		    updated_at = ?
+		WHERE id = 1
+	`, toNullTime(checkedAt), strings.TrimSpace(current), strings.TrimSpace(latest), strings.TrimSpace(status), strings.TrimSpace(message), updatedAt.UTC())
+	if err != nil {
+		return fmt.Errorf("update sync state update check: %w", err)
 	}
 	return nil
 }

@@ -25,6 +25,10 @@ type ExportPayload struct {
 	Usage      json.RawMessage `json:"usage"`
 }
 
+type LatestVersionResponse struct {
+	LatestVersion string `json:"latest-version"`
+}
+
 func NewClient(baseURL, managementKey string, timeout time.Duration, allowInsecureTLS bool) (*Client, error) {
 	baseURL = strings.TrimSpace(baseURL)
 	if baseURL == "" {
@@ -116,6 +120,29 @@ func (c *Client) ImportUsage(ctx context.Context, exportPayload []byte) error {
 		return fmt.Errorf("import usage: %w", err)
 	}
 	return nil
+}
+
+func (c *Client) GetLatestVersion(ctx context.Context, endpoint string) (string, error) {
+	endpoint = strings.TrimSpace(endpoint)
+	if endpoint == "" {
+		endpoint = "/v0/management/latest-version"
+	}
+	if !strings.HasPrefix(endpoint, "/") {
+		endpoint = "/" + endpoint
+	}
+	body, err := c.doJSON(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return "", err
+	}
+	var resp LatestVersionResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return "", fmt.Errorf("decode latest-version response: %w", err)
+	}
+	latest := strings.TrimSpace(resp.LatestVersion)
+	if latest == "" {
+		return "", fmt.Errorf("missing latest version")
+	}
+	return latest, nil
 }
 
 func (c *Client) doJSON(ctx context.Context, method, path string, payload []byte) ([]byte, error) {

@@ -29,6 +29,11 @@ type SyncState struct {
 	LastUsageSnapshotAt   *time.Time
 	LastRecoverImportHash string
 	LastRecoverImportAt   *time.Time
+	LastUpdateCheckAt     *time.Time
+	LastKnownLatest       string
+	LastKnownCurrent      string
+	LastUpdateStatus      string
+	LastUpdateMessage     string
 	UpdatedAt             time.Time
 }
 

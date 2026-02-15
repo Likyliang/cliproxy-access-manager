@@ -224,6 +224,9 @@ func (b *Bot) executeCommand(ctx context.Context, text string, chatID, userID in
 			"/recharge <email> [plan_or_note]",
 			"/sync_now",
 			"/status",
+			"/update_check",
+			"/update_apply",
+			"/usage_sync_now",
 		}, "\n")
 	case "/key_add":
 		if len(args) < 3 {
@@ -458,6 +461,12 @@ func (b *Bot) executeCommand(ctx context.Context, text string, chatID, userID in
 		}
 		_ = b.store.InsertAuditLog(ctx, actor, "sync_now", "manual trigger")
 		return "OK: sync completed"
+	case "/usage_sync_now":
+		if err := b.manager.SyncUsageSnapshot(ctx); err != nil {
+			return "Usage sync failed: " + err.Error()
+		}
+		_ = b.store.InsertAuditLog(ctx, actor, "usage_sync_now", "manual trigger")
+		return "OK: usage snapshot synced"
 	case "/status":
 		status, err := b.manager.Status(ctx)
 		if err != nil {
@@ -473,10 +482,56 @@ func (b *Bot) executeCommand(ctx context.Context, text string, chatID, userID in
 		if status.LastRecoveryImportAt != nil {
 			lines = append(lines, "last_recovery_import="+status.LastRecoveryImportAt.UTC().Format(time.RFC3339))
 		}
+		if status.LastUpdateCheckAt != nil {
+			lines = append(lines, "last_update_check="+status.LastUpdateCheckAt.UTC().Format(time.RFC3339))
+		}
+		if strings.TrimSpace(status.CurrentVersion) != "" {
+			lines = append(lines, "current_version="+status.CurrentVersion)
+		}
+		if strings.TrimSpace(status.LatestVersion) != "" {
+			lines = append(lines, "latest_version="+status.LatestVersion)
+		}
+		if strings.TrimSpace(status.UpdateStatus) != "" {
+			lines = append(lines, "update_status="+status.UpdateStatus)
+		}
+		if strings.TrimSpace(status.UpdateMessage) != "" {
+			lines = append(lines, "update_message="+status.UpdateMessage)
+		}
+		if strings.TrimSpace(status.UpdateCheckTime) != "" {
+			lines = append(lines, "daily_update_check_utc="+status.UpdateCheckTime)
+		}
+		if status.UpdateCommandSet {
+			lines = append(lines, "update_apply_command=configured")
+		} else {
+			lines = append(lines, "update_apply_command=not_configured")
+		}
 		if status.Message != "" {
 			lines = append(lines, "message="+status.Message)
 		}
 		return strings.Join(lines, "\n")
+	case "/update_check":
+		if err := b.manager.CheckMainProjectUpdateNow(ctx); err != nil {
+			return "Update check failed: " + err.Error()
+		}
+		status, err := b.manager.Status(ctx)
+		if err != nil {
+			return "Checked, but status read failed: " + err.Error()
+		}
+		_ = b.store.InsertAuditLog(ctx, actor, "update_check_manual", "telegram trigger")
+		return fmt.Sprintf("update check done\ncurrent=%s\nlatest=%s\nstatus=%s\nmessage=%s", status.CurrentVersion, status.LatestVersion, status.UpdateStatus, status.UpdateMessage)
+	case "/update_apply":
+		if err := b.manager.ApplyMainProjectUpdateNow(ctx); err != nil {
+			return "Update apply failed: " + err.Error()
+		}
+		if err := b.manager.CheckMainProjectUpdateNow(ctx); err != nil {
+			_ = b.store.InsertAuditLog(ctx, actor, "update_check_after_apply_failed", err.Error())
+		}
+		status, err := b.manager.Status(ctx)
+		if err != nil {
+			return "Applied, but status read failed: " + err.Error()
+		}
+		_ = b.store.InsertAuditLog(ctx, actor, "update_apply_manual", "telegram trigger")
+		return fmt.Sprintf("update apply completed\ncurrent=%s\nlatest=%s\nstatus=%s\nmessage=%s", status.CurrentVersion, status.LatestVersion, status.UpdateStatus, status.UpdateMessage)
 	default:
 		return "Unknown command. Use /help"
 	}

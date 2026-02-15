@@ -2,8 +2,10 @@ package reconcile
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
+	"os/exec"
 	"strings"
 	"sync"
 	"time"
@@ -20,7 +22,14 @@ type Manager struct {
 	usageSyncInterval     time.Duration
 	recoveryCheckInterval time.Duration
 
-	wg sync.WaitGroup
+	updateCheckEnabled       bool
+	updateCheckTime          string
+	managementCurrentVersion string
+	latestVersionEndpoint    string
+	updateApplyCommand       string
+
+	updateMu sync.Mutex
+	wg       sync.WaitGroup
 }
 
 type Status struct {
@@ -28,19 +37,31 @@ type Status struct {
 	LastKeySyncAt        *time.Time `json:"last_key_sync_at,omitempty"`
 	LastUsageSnapshotAt  *time.Time `json:"last_usage_snapshot_at,omitempty"`
 	LastRecoveryImportAt *time.Time `json:"last_recovery_import_at,omitempty"`
+	LastUpdateCheckAt    *time.Time `json:"last_update_check_at,omitempty"`
 	LastKeysHash         string     `json:"last_keys_hash,omitempty"`
 	LastSnapshotHash     string     `json:"last_snapshot_hash,omitempty"`
 	LastRecoveryHash     string     `json:"last_recovery_hash,omitempty"`
+	CurrentVersion       string     `json:"current_version,omitempty"`
+	LatestVersion        string     `json:"latest_version,omitempty"`
+	UpdateStatus         string     `json:"update_status,omitempty"`
+	UpdateMessage        string     `json:"update_message,omitempty"`
+	UpdateCheckTime      string     `json:"update_check_time,omitempty"`
+	UpdateCommandSet     bool       `json:"update_command_set"`
 	Message              string     `json:"message,omitempty"`
 }
 
-func NewManager(s *store.Store, c *cliproxy.Client, keySyncInterval, usageSyncInterval, recoveryCheckInterval time.Duration) *Manager {
+func NewManager(s *store.Store, c *cliproxy.Client, keySyncInterval, usageSyncInterval, recoveryCheckInterval time.Duration, updateCheckEnabled bool, updateCheckTime, currentVersion, latestVersionEndpoint, updateApplyCommand string) *Manager {
 	return &Manager{
-		store:                 s,
-		client:                c,
-		keySyncInterval:       keySyncInterval,
-		usageSyncInterval:     usageSyncInterval,
-		recoveryCheckInterval: recoveryCheckInterval,
+		store:                    s,
+		client:                   c,
+		keySyncInterval:          keySyncInterval,
+		usageSyncInterval:        usageSyncInterval,
+		recoveryCheckInterval:    recoveryCheckInterval,
+		updateCheckEnabled:       updateCheckEnabled,
+		updateCheckTime:          strings.TrimSpace(updateCheckTime),
+		managementCurrentVersion: strings.TrimSpace(currentVersion),
+		latestVersionEndpoint:    strings.TrimSpace(latestVersionEndpoint),
+		updateApplyCommand:       strings.TrimSpace(updateApplyCommand),
 	}
 }
 
@@ -61,6 +82,13 @@ func (m *Manager) Start(ctx context.Context) {
 		defer m.wg.Done()
 		m.runLoop(ctx, m.recoveryCheckInterval, "recovery", m.RecoverIfNeeded)
 	}()
+	if m.updateCheckEnabled {
+		m.wg.Add(1)
+		go func() {
+			defer m.wg.Done()
+			m.runDailyUpdateCheckLoop(ctx)
+		}()
+	}
 }
 
 func (m *Manager) Wait() {
@@ -89,6 +117,50 @@ func (m *Manager) runLoop(ctx context.Context, interval time.Duration, name stri
 			}
 		}
 	}
+}
+
+func (m *Manager) runDailyUpdateCheckLoop(ctx context.Context) {
+	if err := m.CheckMainProjectUpdateNow(ctx); err != nil {
+		log.Printf("[WARN] update-check initial run failed: %v", err)
+	}
+	for {
+		nextRun, err := nextDailyTimeUTC(time.Now().UTC(), m.updateCheckTime)
+		if err != nil {
+			log.Printf("[WARN] update-check schedule parse failed: %v", err)
+			nextRun = time.Now().UTC().Add(24 * time.Hour)
+		}
+		wait := time.Until(nextRun)
+		if wait < 0 {
+			wait = 0
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+			if err := m.CheckMainProjectUpdateNow(ctx); err != nil {
+				log.Printf("[WARN] update-check failed: %v", err)
+			}
+		}
+	}
+}
+
+func nextDailyTimeUTC(now time.Time, hhmm string) (time.Time, error) {
+	hhmm = strings.TrimSpace(hhmm)
+	hour := 0
+	minute := 0
+	if _, err := fmt.Sscanf(hhmm, "%d:%d", &hour, &minute); err != nil {
+		return time.Time{}, fmt.Errorf("invalid daily time")
+	}
+	if hour < 0 || hour > 23 || minute < 0 || minute > 59 {
+		return time.Time{}, fmt.Errorf("invalid daily time")
+	}
+	candidate := time.Date(now.Year(), now.Month(), now.Day(), hour, minute, 0, 0, time.UTC)
+	if !candidate.After(now) {
+		candidate = candidate.Add(24 * time.Hour)
+	}
+	return candidate, nil
 }
 
 func (m *Manager) SyncKeys(ctx context.Context) error {
@@ -235,6 +307,69 @@ func (m *Manager) ForceSync(ctx context.Context) error {
 	return nil
 }
 
+func (m *Manager) CheckMainProjectUpdateNow(ctx context.Context) error {
+	if m == nil {
+		return fmt.Errorf("nil manager")
+	}
+	latest, err := m.client.GetLatestVersion(ctx, m.latestVersionEndpoint)
+	checkedAt := time.Now().UTC()
+	if err != nil {
+		_ = m.store.UpdateSyncStateUpdateCheck(ctx, &checkedAt, m.managementCurrentVersion, "", "check_failed", err.Error(), &checkedAt)
+		return err
+	}
+	status := "up_to_date"
+	message := "main project is up to date"
+	if strings.TrimSpace(m.managementCurrentVersion) == "" {
+		status = "unknown_current"
+		message = "current version is not configured"
+	} else if latest != strings.TrimSpace(m.managementCurrentVersion) {
+		status = "update_available"
+		message = fmt.Sprintf("new version available: latest=%s current=%s", latest, strings.TrimSpace(m.managementCurrentVersion))
+	}
+	if err := m.store.UpdateSyncStateUpdateCheck(ctx, &checkedAt, m.managementCurrentVersion, latest, status, message, &checkedAt); err != nil {
+		return err
+	}
+	_ = m.store.InsertAuditLog(ctx, "reconciler", "main_project_update_check", message)
+	return nil
+}
+
+func (m *Manager) ApplyMainProjectUpdateNow(ctx context.Context) error {
+	if m == nil {
+		return fmt.Errorf("nil manager")
+	}
+	m.updateMu.Lock()
+	defer m.updateMu.Unlock()
+	command := strings.TrimSpace(m.updateApplyCommand)
+	if command == "" {
+		return fmt.Errorf("update command is not configured")
+	}
+	if err := m.SyncUsageSnapshot(ctx); err != nil {
+		return fmt.Errorf("sync usage snapshot before update: %w", err)
+	}
+	if err := m.RecoverIfNeeded(ctx); err != nil {
+		return fmt.Errorf("recovery pre-check before update: %w", err)
+	}
+	cmd := exec.CommandContext(ctx, "sh", "-lc", command)
+	output, err := cmd.CombinedOutput()
+	result := strings.TrimSpace(string(output))
+	if len(result) > 1200 {
+		result = result[:1200]
+	}
+	if err != nil {
+		detail := fmt.Sprintf("command failed: %v output=%s", err, result)
+		_ = m.store.InsertAuditLog(ctx, "reconciler", "main_project_update_apply_failed", detail)
+		return errors.New(detail)
+	}
+	if err := m.SyncUsageSnapshot(ctx); err != nil {
+		_ = m.store.InsertAuditLog(ctx, "reconciler", "main_project_update_apply_warn", "update command succeeded but usage sync after update failed: "+err.Error())
+	}
+	if err := m.RecoverIfNeeded(ctx); err != nil {
+		_ = m.store.InsertAuditLog(ctx, "reconciler", "main_project_update_apply_warn", "update command succeeded but recovery after update failed: "+err.Error())
+	}
+	_ = m.store.InsertAuditLog(ctx, "reconciler", "main_project_update_apply", "update command succeeded")
+	return nil
+}
+
 func (m *Manager) Status(ctx context.Context) (Status, error) {
 	if m == nil {
 		return Status{}, fmt.Errorf("nil manager")
@@ -249,9 +384,16 @@ func (m *Manager) Status(ctx context.Context) (Status, error) {
 		LastKeySyncAt:        state.LastAppliedAt,
 		LastUsageSnapshotAt:  state.LastUsageSnapshotAt,
 		LastRecoveryImportAt: state.LastRecoverImportAt,
+		LastUpdateCheckAt:    state.LastUpdateCheckAt,
 		LastKeysHash:         state.LastAppliedKeysHash,
 		LastSnapshotHash:     state.LastUsageSnapshotHash,
 		LastRecoveryHash:     state.LastRecoverImportHash,
+		CurrentVersion:       state.LastKnownCurrent,
+		LatestVersion:        state.LastKnownLatest,
+		UpdateStatus:         state.LastUpdateStatus,
+		UpdateMessage:        state.LastUpdateMessage,
+		UpdateCheckTime:      m.updateCheckTime,
+		UpdateCommandSet:     strings.TrimSpace(m.updateApplyCommand) != "",
 	}
 	if healthErr != nil {
 		status.Message = healthErr.Error()

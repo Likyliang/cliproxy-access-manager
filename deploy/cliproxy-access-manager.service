@@ -17,6 +17,11 @@ Environment=APIM_DB_PATH=/var/lib/cliproxy-access-manager/apim.db
 Environment=APIM_KEY_SYNC_INTERVAL=30s
 Environment=APIM_USAGE_SYNC_INTERVAL=2m
 Environment=APIM_RECOVERY_CHECK_INTERVAL=60s
+Environment=APIM_UPDATE_CHECK_ENABLED=true
+Environment=APIM_UPDATE_CHECK_TIME=04:00
+Environment=APIM_MANAGEMENT_CURRENT_VERSION=
+Environment=APIM_MANAGEMENT_LATEST_VERSION_URL=/v0/management/latest-version
+Environment=APIM_UPDATE_APPLY_COMMAND=
 Environment=TELEGRAM_POLL_INTERVAL=3s
 Environment=HTTP_PROXY=http://127.0.0.1:20171
 Environment=HTTPS_PROXY=http://127.0.0.1:20171

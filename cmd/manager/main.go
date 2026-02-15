@@ -38,7 +38,18 @@ func main() {
 		log.Fatalf("build cliproxy client failed: %v", err)
 	}
 
-	reconciler := reconcile.NewManager(s, client, cfg.ManagementPollInterval, cfg.UsageSyncInterval, cfg.RecoveryInterval)
+	reconciler := reconcile.NewManager(
+		s,
+		client,
+		cfg.ManagementPollInterval,
+		cfg.UsageSyncInterval,
+		cfg.RecoveryInterval,
+		cfg.UpdateCheckEnabled,
+		cfg.UpdateCheckTime,
+		cfg.ManagementCurrentVersion,
+		cfg.ManagementLatestVersionURL,
+		cfg.UpdateApplyCommand,
+	)
 	if err := reconciler.RecoverIfNeeded(context.Background()); err != nil {
 		log.Printf("[WARN] initial recovery import failed: %v", err)
 	}
@@ -114,6 +125,37 @@ func buildHTTPServer(cfg cfgpkg.Config, s *store.Store, reconciler *reconcile.Ma
 		writeJSON(w, http.StatusOK, status)
 	}))
 
+	mux.HandleFunc("/update/check", withAuth(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+			return
+		}
+		if err := reconciler.CheckMainProjectUpdateNow(r.Context()); err != nil {
+			writeJSON(w, http.StatusBadGateway, map[string]any{"error": err.Error()})
+			return
+		}
+		_ = s.InsertAuditLog(r.Context(), "http", "update_check_manual", "manual trigger")
+		status, _ := reconciler.Status(r.Context())
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "status": status})
+	}))
+
+	mux.HandleFunc("/update/apply", withAuth(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+			return
+		}
+		if err := reconciler.ApplyMainProjectUpdateNow(r.Context()); err != nil {
+			writeJSON(w, http.StatusBadGateway, map[string]any{"error": err.Error()})
+			return
+		}
+		if err := reconciler.CheckMainProjectUpdateNow(r.Context()); err != nil {
+			_ = s.InsertAuditLog(r.Context(), "http", "update_check_after_apply_failed", err.Error())
+		}
+		_ = s.InsertAuditLog(r.Context(), "http", "update_apply_manual", "manual trigger")
+		status, _ := reconciler.Status(r.Context())
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "status": status})
+	}))
+
 	mux.HandleFunc("/sync_now", withAuth(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
@@ -124,6 +166,19 @@ func buildHTTPServer(cfg cfgpkg.Config, s *store.Store, reconciler *reconcile.Ma
 			return
 		}
 		_ = s.InsertAuditLog(r.Context(), "http", "sync_now", "manual")
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	}))
+
+	mux.HandleFunc("/usage/sync_now", withAuth(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+			return
+		}
+		if err := reconciler.SyncUsageSnapshot(r.Context()); err != nil {
+			writeJSON(w, http.StatusBadGateway, map[string]any{"error": err.Error()})
+			return
+		}
+		_ = s.InsertAuditLog(r.Context(), "http", "usage_sync_now", "manual")
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 	}))
 
