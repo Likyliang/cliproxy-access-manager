@@ -13,6 +13,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v6/plugins/cliproxy-access-manager/internal/cliproxy"
 	"github.com/router-for-me/CLIProxyAPI/v6/plugins/cliproxy-access-manager/internal/store"
+	"golang.org/x/mod/semver"
 )
 
 type Manager struct {
@@ -23,14 +24,26 @@ type Manager struct {
 	usageSyncInterval     time.Duration
 	recoveryCheckInterval time.Duration
 
-	updateCheckEnabled    bool
-	updateCheckTime       string
-	latestVersionEndpoint string
-	updateApplyCommand    string
-	autoUpdateEnabled     bool
-	autoUpdateService     string
-	autoUpdateComposeFile string
-	autoUpdateWorkingDir  string
+	updateCheckEnabled        bool
+	updateCheckTime           string
+	latestVersionEndpoint     string
+	updateApplyCommand        string
+	updateAutoApplyEnabled    bool
+	updateAllowCustomCommand  bool
+	recoverySnapshotScanLimit int
+	updateCheckFn             func(context.Context) error
+	applyUpdateFn             func(context.Context) error
+	syncUsageSnapshotFn       func(context.Context) error
+	recoverIfNeededFn         func(context.Context) error
+	syncKeysFn                func(context.Context) error
+	exportUsageFn             func(context.Context) ([]byte, time.Time, error)
+	getLatestVersionFn        func(context.Context, string) (string, string, error)
+	importUsageFn             func(context.Context, []byte) error
+	evaluateUsageControlsFn   func(context.Context, string) ([]store.UsageControlEvaluationResult, bool, error)
+	autoUpdateEnabled         bool
+	autoUpdateService         string
+	autoUpdateComposeFile     string
+	autoUpdateWorkingDir      string
 
 	updateMu sync.Mutex
 	wg       sync.WaitGroup
@@ -55,17 +68,38 @@ type Status struct {
 	Message              string     `json:"message,omitempty"`
 }
 
-func NewManager(s *store.Store, c *cliproxy.Client, keySyncInterval, usageSyncInterval, recoveryCheckInterval time.Duration, updateCheckEnabled bool, updateCheckTime, latestVersionEndpoint, updateApplyCommand string) *Manager {
+func NewManager(s *store.Store, c *cliproxy.Client, keySyncInterval, usageSyncInterval, recoveryCheckInterval time.Duration, updateCheckEnabled bool, updateCheckTime, latestVersionEndpoint, updateApplyCommand string, updateAutoApplyEnabled, updateAllowCustomCommand bool, recoverySnapshotScanLimit int) *Manager {
 	m := &Manager{
-		store:                 s,
-		client:                c,
-		keySyncInterval:       keySyncInterval,
-		usageSyncInterval:     usageSyncInterval,
-		recoveryCheckInterval: recoveryCheckInterval,
-		updateCheckEnabled:    updateCheckEnabled,
-		updateCheckTime:       strings.TrimSpace(updateCheckTime),
-		latestVersionEndpoint: strings.TrimSpace(latestVersionEndpoint),
-		updateApplyCommand:    strings.TrimSpace(updateApplyCommand),
+		store:                     s,
+		client:                    c,
+		keySyncInterval:           keySyncInterval,
+		usageSyncInterval:         usageSyncInterval,
+		recoveryCheckInterval:     recoveryCheckInterval,
+		updateCheckEnabled:        updateCheckEnabled,
+		updateCheckTime:           strings.TrimSpace(updateCheckTime),
+		latestVersionEndpoint:     strings.TrimSpace(latestVersionEndpoint),
+		updateApplyCommand:        strings.TrimSpace(updateApplyCommand),
+		updateAutoApplyEnabled:    updateAutoApplyEnabled,
+		updateAllowCustomCommand:  updateAllowCustomCommand,
+		recoverySnapshotScanLimit: recoverySnapshotScanLimit,
+	}
+	if m.recoverySnapshotScanLimit <= 0 {
+		m.recoverySnapshotScanLimit = 10
+	}
+	m.updateCheckFn = m.checkMainProjectUpdateNow
+	m.applyUpdateFn = m.applyMainProjectUpdateNow
+	m.syncUsageSnapshotFn = m.syncUsageSnapshot
+	m.recoverIfNeededFn = m.recoverIfNeeded
+	m.syncKeysFn = m.syncKeys
+	if m.client != nil {
+		m.exportUsageFn = m.client.ExportUsage
+		m.getLatestVersionFn = m.client.GetLatestVersion
+		m.importUsageFn = m.client.ImportUsage
+	}
+	if m.store != nil {
+		m.evaluateUsageControlsFn = func(ctx context.Context, actor string) ([]store.UsageControlEvaluationResult, bool, error) {
+			return m.store.EvaluateUsageControls(ctx, time.Now().UTC(), actor)
+		}
 	}
 	m.initAutoUpdateConfig()
 	return m
@@ -78,7 +112,7 @@ func (m *Manager) Start(ctx context.Context) {
 	m.wg.Add(3)
 	go func() {
 		defer m.wg.Done()
-		m.runLoop(ctx, m.keySyncInterval, "key-sync", m.SyncKeys)
+		m.runLoop(ctx, m.keySyncInterval, "key-sync", m.syncKeysFn)
 	}()
 	go func() {
 		defer m.wg.Done()
@@ -173,6 +207,19 @@ func (m *Manager) SyncKeys(ctx context.Context) error {
 	if m == nil {
 		return fmt.Errorf("nil manager")
 	}
+	if m.syncKeysFn == nil {
+		return fmt.Errorf("sync keys function is not configured")
+	}
+	return m.syncKeysFn(ctx)
+}
+
+func (m *Manager) syncKeys(ctx context.Context) error {
+	if m.store == nil {
+		return fmt.Errorf("nil store")
+	}
+	if m.client == nil {
+		return fmt.Errorf("nil client")
+	}
 	activeKeys, err := m.store.ListActiveKeys(ctx, time.Now().UTC())
 	if err != nil {
 		return err
@@ -212,7 +259,40 @@ func (m *Manager) SyncUsageSnapshot(ctx context.Context) error {
 	if m == nil {
 		return fmt.Errorf("nil manager")
 	}
-	payload, exportedAt, err := m.client.ExportUsage(ctx)
+	if m.syncUsageSnapshotFn == nil {
+		return fmt.Errorf("sync usage snapshot function is not configured")
+	}
+	return m.syncUsageSnapshotFn(ctx)
+}
+
+func (m *Manager) EvaluateUsageControlsNow(ctx context.Context, actor string) ([]store.UsageControlEvaluationResult, bool, error) {
+	if m == nil {
+		return nil, false, fmt.Errorf("nil manager")
+	}
+	if m.evaluateUsageControlsFn == nil {
+		return nil, false, fmt.Errorf("usage control evaluation function is not configured")
+	}
+	results, keysChanged, err := m.evaluateUsageControlsFn(ctx, actor)
+	if keysChanged {
+		if syncErr := m.syncKeysFn(ctx); syncErr != nil {
+			if err == nil {
+				err = fmt.Errorf("sync keys after usage control evaluation: %w", syncErr)
+			} else {
+				err = fmt.Errorf("%v; sync keys after usage control evaluation: %w", err, syncErr)
+			}
+		}
+	}
+	return results, keysChanged, err
+}
+
+func (m *Manager) syncUsageSnapshot(ctx context.Context) error {
+	if m.store == nil {
+		return fmt.Errorf("nil store")
+	}
+	if m.exportUsageFn == nil {
+		return fmt.Errorf("export usage function is not configured")
+	}
+	payload, exportedAt, err := m.exportUsageFn(ctx)
 	if err != nil {
 		return err
 	}
@@ -242,6 +322,9 @@ func (m *Manager) SyncUsageSnapshot(ctx context.Context) error {
 		_ = m.store.InsertAuditLog(ctx, "reconciler", "sync_usage_snapshot", fmt.Sprintf("hash=%s exported_at=%s", hash, exportedAt.Format(time.RFC3339)))
 		log.Printf("[INFO] saved usage snapshot: %s", hash)
 	}
+	if _, _, evalErr := m.EvaluateUsageControlsNow(ctx, "reconciler"); evalErr != nil {
+		return fmt.Errorf("evaluate usage controls after usage sync: %w", evalErr)
+	}
 	return nil
 }
 
@@ -249,25 +332,64 @@ func (m *Manager) RecoverIfNeeded(ctx context.Context) error {
 	if m == nil {
 		return fmt.Errorf("nil manager")
 	}
-	latest, err := m.store.GetLatestUsageSnapshot(ctx)
+	if m.recoverIfNeededFn == nil {
+		return fmt.Errorf("recover function is not configured")
+	}
+	return m.recoverIfNeededFn(ctx)
+}
+
+func (m *Manager) recoverIfNeeded(ctx context.Context) error {
+	if m.store == nil {
+		return fmt.Errorf("nil store")
+	}
+	if m.client == nil {
+		return fmt.Errorf("nil client")
+	}
+	if m.exportUsageFn == nil {
+		return fmt.Errorf("export usage function is not configured")
+	}
+	if m.importUsageFn == nil {
+		return fmt.Errorf("import usage function is not configured")
+	}
+	snapshots, err := m.store.ListRecentUsageSnapshots(ctx, m.recoverySnapshotScanLimit)
 	if err != nil {
 		return err
 	}
-	if latest == nil {
+	if len(snapshots) == 0 {
 		return nil
 	}
-	usageHash, err := store.UsageHashFromExportPayload([]byte(latest.PayloadJSON))
-	if err != nil {
-		return err
+
+	var selected *store.UsageSnapshot
+	var selectedHash string
+	for idx := range snapshots {
+		snapshot := &snapshots[idx]
+		hash, hashErr := store.UsageHashFromExportPayload([]byte(snapshot.PayloadJSON))
+		if hashErr != nil {
+			detail := fmt.Sprintf("snapshot parse failed id=%d exported_at=%s err=%v", snapshot.ID, snapshot.ExportedAt.UTC().Format(time.RFC3339), hashErr)
+			_ = m.store.InsertAuditLog(ctx, "reconciler", "recover_usage_snapshot_invalid", detail)
+			continue
+		}
+		selected = snapshot
+		selectedHash = hash
+		if idx > 0 {
+			detail := fmt.Sprintf("fallback to older snapshot id=%d exported_at=%s", snapshot.ID, snapshot.ExportedAt.UTC().Format(time.RFC3339))
+			_ = m.store.InsertAuditLog(ctx, "reconciler", "recover_usage_snapshot_fallback", detail)
+		}
+		break
 	}
+	if selected == nil {
+		return fmt.Errorf("all recent usage snapshots are invalid")
+	}
+
 	state, err := m.store.GetSyncState(ctx)
 	if err != nil {
 		return err
 	}
-	if strings.TrimSpace(state.LastRecoverImportHash) == usageHash {
+	if strings.TrimSpace(state.LastRecoverImportHash) == selectedHash {
 		return nil
 	}
-	livePayload, _, err := m.client.ExportUsage(ctx)
+
+	livePayload, _, err := m.exportUsageFn(ctx)
 	if err != nil {
 		return err
 	}
@@ -280,34 +402,38 @@ func (m *Manager) RecoverIfNeeded(ctx context.Context) error {
 		if hashErr != nil {
 			return hashErr
 		}
-		if liveHash == usageHash {
+		if liveHash == selectedHash {
 			now := time.Now().UTC()
-			if err := m.store.TouchSyncStateRecoveryHash(ctx, usageHash, &now); err != nil {
+			if err := m.store.TouchSyncStateRecoveryHash(ctx, selectedHash, &now); err != nil {
 				return err
 			}
+			return nil
 		}
-		return nil
+		detail := fmt.Sprintf("live/hash mismatch live=%s snapshot=%s snapshot_id=%d", liveHash, selectedHash, selected.ID)
+		_ = m.store.InsertAuditLog(ctx, "reconciler", "recover_usage_live_hash_mismatch", detail)
+		return fmt.Errorf("%s", detail)
 	}
-	if err := m.client.ImportUsage(ctx, []byte(latest.PayloadJSON)); err != nil {
+
+	if err := m.importUsageFn(ctx, []byte(selected.PayloadJSON)); err != nil {
 		return err
 	}
 	now := time.Now().UTC()
-	if err := m.store.UpdateSyncStateRecovery(ctx, usageHash, &now, &now); err != nil {
+	if err := m.store.UpdateSyncStateRecovery(ctx, selectedHash, &now, &now); err != nil {
 		return err
 	}
-	_ = m.store.InsertAuditLog(ctx, "reconciler", "recover_usage_import", fmt.Sprintf("hash=%s", usageHash))
-	if err := m.SyncKeys(ctx); err != nil {
+	_ = m.store.InsertAuditLog(ctx, "reconciler", "recover_usage_import", fmt.Sprintf("hash=%s snapshot_id=%d", selectedHash, selected.ID))
+	if err := m.syncKeysFn(ctx); err != nil {
 		log.Printf("[WARN] key sync after recovery failed: %v", err)
 	}
-	log.Printf("[INFO] imported latest usage snapshot for recovery: %s", usageHash)
+	log.Printf("[INFO] imported usage snapshot for recovery: %s", selectedHash)
 	return nil
 }
 
 func (m *Manager) ForceSync(ctx context.Context) error {
-	if err := m.SyncKeys(ctx); err != nil {
+	if err := m.syncKeysFn(ctx); err != nil {
 		return err
 	}
-	if err := m.SyncUsageSnapshot(ctx); err != nil {
+	if err := m.syncUsageSnapshotFn(ctx); err != nil {
 		return err
 	}
 	return nil
@@ -317,26 +443,73 @@ func (m *Manager) CheckMainProjectUpdateNow(ctx context.Context) error {
 	if m == nil {
 		return fmt.Errorf("nil manager")
 	}
-	latest, current, err := m.client.GetLatestVersion(ctx, m.latestVersionEndpoint)
+	if m.updateCheckFn == nil {
+		return fmt.Errorf("update check function is not configured")
+	}
+	return m.updateCheckFn(ctx)
+}
+
+func (m *Manager) checkMainProjectUpdateNow(ctx context.Context) error {
+	return m.checkMainProjectUpdateNowInternal(ctx, true)
+}
+
+func (m *Manager) checkMainProjectUpdateNowInternal(ctx context.Context, allowAutoApply bool) error {
+	if m.updateAutoApplyEnabled && m.applyUpdateFn == nil {
+		return fmt.Errorf("apply update function is not configured")
+	}
+	latestVersionFn := m.getLatestVersionFn
+	if latestVersionFn == nil {
+		if m.client == nil {
+			return fmt.Errorf("nil client")
+		}
+		latestVersionFn = m.client.GetLatestVersion
+	}
+	latest, current, err := latestVersionFn(ctx, m.latestVersionEndpoint)
 	checkedAt := time.Now().UTC()
 	if err != nil {
-		_ = m.store.UpdateSyncStateUpdateCheck(ctx, &checkedAt, "", "", "check_failed", err.Error(), &checkedAt)
+		if m.store != nil {
+			_ = m.store.UpdateSyncStateUpdateCheck(ctx, &checkedAt, "", "", "check_failed", err.Error(), &checkedAt)
+		}
 		return err
 	}
+	latest = strings.TrimSpace(latest)
 	current = strings.TrimSpace(current)
 	status := "up_to_date"
 	message := "main project is up to date"
 	if current == "" {
 		status = "unknown_current"
 		message = "current version header is missing"
-	} else if latest != current {
-		status = "update_available"
-		message = fmt.Sprintf("new version available: latest=%s current=%s", latest, current)
+	} else {
+		compare, semErr := compareSemver(latest, current)
+		if semErr != nil {
+			status = "invalid_version"
+			message = semErr.Error()
+		} else if compare > 0 {
+			status = "update_available"
+			message = fmt.Sprintf("new version available: latest=%s current=%s", latest, current)
+		} else if compare < 0 {
+			message = fmt.Sprintf("current version is newer than latest: latest=%s current=%s", latest, current)
+		}
 	}
-	if err := m.store.UpdateSyncStateUpdateCheck(ctx, &checkedAt, current, latest, status, message, &checkedAt); err != nil {
-		return err
+	if m.store != nil {
+		if err := m.store.UpdateSyncStateUpdateCheck(ctx, &checkedAt, current, latest, status, message, &checkedAt); err != nil {
+			return err
+		}
+		_ = m.store.InsertAuditLog(ctx, "reconciler", "main_project_update_check", message)
 	}
-	_ = m.store.InsertAuditLog(ctx, "reconciler", "main_project_update_check", message)
+
+	if allowAutoApply && status == "update_available" && m.updateAutoApplyEnabled {
+		if err := m.applyUpdateFn(ctx); err != nil {
+			detail := "auto update apply failed: " + err.Error()
+			if m.store != nil {
+				_ = m.store.InsertAuditLog(ctx, "reconciler", "main_project_update_auto_apply_failed", detail)
+			}
+			return fmt.Errorf("%s", detail)
+		}
+		if err := m.checkMainProjectUpdateNowInternal(ctx, false); err != nil {
+			return fmt.Errorf("refresh update status after auto apply: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -344,13 +517,29 @@ func (m *Manager) ApplyMainProjectUpdateNow(ctx context.Context) error {
 	if m == nil {
 		return fmt.Errorf("nil manager")
 	}
+	if m.applyUpdateFn == nil {
+		return fmt.Errorf("apply update function is not configured")
+	}
+	return m.applyUpdateFn(ctx)
+}
+
+func (m *Manager) applyMainProjectUpdateNow(ctx context.Context) error {
+	if m.syncUsageSnapshotFn == nil {
+		return fmt.Errorf("sync usage snapshot function is not configured")
+	}
+	if m.recoverIfNeededFn == nil {
+		return fmt.Errorf("recover function is not configured")
+	}
+	if m.store == nil {
+		return fmt.Errorf("nil store")
+	}
 	m.updateMu.Lock()
 	defer m.updateMu.Unlock()
 
-	if err := m.SyncUsageSnapshot(ctx); err != nil {
+	if err := m.syncUsageSnapshotFn(ctx); err != nil {
 		return fmt.Errorf("sync usage snapshot before update: %w", err)
 	}
-	if err := m.RecoverIfNeeded(ctx); err != nil {
+	if err := m.recoverIfNeededFn(ctx); err != nil {
 		return fmt.Errorf("recovery pre-check before update: %w", err)
 	}
 
@@ -369,10 +558,10 @@ func (m *Manager) ApplyMainProjectUpdateNow(ctx context.Context) error {
 		return fmt.Errorf("%s", detail)
 	}
 
-	if err := m.SyncUsageSnapshot(ctx); err != nil {
+	if err := m.syncUsageSnapshotFn(ctx); err != nil {
 		_ = m.store.InsertAuditLog(ctx, "reconciler", "main_project_update_apply_warn", "update apply succeeded but usage sync after update failed: "+err.Error())
 	}
-	if err := m.RecoverIfNeeded(ctx); err != nil {
+	if err := m.recoverIfNeededFn(ctx); err != nil {
 		_ = m.store.InsertAuditLog(ctx, "reconciler", "main_project_update_apply_warn", "update apply succeeded but recovery after update failed: "+err.Error())
 	}
 	_ = m.store.InsertAuditLog(ctx, "reconciler", "main_project_update_apply", applyDesc+" succeeded")
@@ -383,13 +572,19 @@ func (m *Manager) Status(ctx context.Context) (Status, error) {
 	if m == nil {
 		return Status{}, fmt.Errorf("nil manager")
 	}
+	if m.store == nil {
+		return Status{}, fmt.Errorf("nil store")
+	}
 	state, err := m.store.GetSyncState(ctx)
 	if err != nil {
 		return Status{}, err
 	}
-	healthErr := m.client.Health(ctx)
+	var healthErr error
+	if m.client != nil {
+		healthErr = m.client.Health(ctx)
+	}
 	status := Status{
-		Healthy:              healthErr == nil,
+		Healthy:              m.client != nil && healthErr == nil,
 		LastKeySyncAt:        state.LastAppliedAt,
 		LastUsageSnapshotAt:  state.LastUsageSnapshotAt,
 		LastRecoveryImportAt: state.LastRecoverImportAt,
@@ -459,6 +654,13 @@ func (m *Manager) runAutoComposeUpdate(ctx context.Context) (string, error) {
 }
 
 func (m *Manager) runCustomUpdateCommand(ctx context.Context, command string) (string, error) {
+	if !m.updateAllowCustomCommand {
+		reason := "custom update command is blocked because APIM_UPDATE_ALLOW_CUSTOM_COMMAND=false"
+		if m.store != nil {
+			_ = m.store.InsertAuditLog(ctx, "reconciler", "main_project_update_apply_blocked", reason)
+		}
+		return "", fmt.Errorf("%s", reason)
+	}
 	cmd := exec.CommandContext(ctx, "sh", "-lc", command)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -617,4 +819,30 @@ func trimOutput(raw []byte, limit int) string {
 		return text
 	}
 	return text[:limit]
+}
+
+func normalizeVersion(raw string) (string, error) {
+	version := strings.TrimSpace(raw)
+	if version == "" {
+		return "", fmt.Errorf("version is empty")
+	}
+	if !strings.HasPrefix(version, "v") {
+		version = "v" + version
+	}
+	if !semver.IsValid(version) {
+		return "", fmt.Errorf("invalid semantic version: %s", strings.TrimSpace(raw))
+	}
+	return version, nil
+}
+
+func compareSemver(latest, current string) (int, error) {
+	normalizedLatest, err := normalizeVersion(latest)
+	if err != nil {
+		return 0, fmt.Errorf("invalid latest version %q: %w", strings.TrimSpace(latest), err)
+	}
+	normalizedCurrent, err := normalizeVersion(current)
+	if err != nil {
+		return 0, fmt.Errorf("invalid current version %q: %w", strings.TrimSpace(current), err)
+	}
+	return semver.Compare(normalizedLatest, normalizedCurrent), nil
 }

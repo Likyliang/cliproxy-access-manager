@@ -267,7 +267,7 @@ func (b *Bot) executeCommand(ctx context.Context, text string, chatID, userID in
 			"/usage_key <key> [24h|7d|duration]",
 			"/usage_top [24h|7d|duration]",
 			"/me <email> [24h|7d|duration]",
-			"/recharge <email> [plan_or_note]",
+			"/recharge <email> <plan_id> [note]",
 			"/sync_now",
 			"/status",
 			"/update_check",
@@ -506,20 +506,25 @@ func (b *Bot) executeCommand(ctx context.Context, text string, chatID, userID in
 		}
 		return fmt.Sprintf("account=%s\nkeys=%s\nvalid=%s\nusage since %s\nrequests=%d failed=%d tokens=%d", summary.Email, keys, valid, since.Format(time.RFC3339), summary.TotalRequests, summary.FailedRequests, summary.TotalTokens)
 	case "/recharge":
-		if len(args) < 1 {
-			return "Usage: /recharge <email> [plan_or_note]"
+		if len(args) < 2 {
+			return "Usage: /recharge <email> <plan_id> [note]"
 		}
 		email := strings.TrimSpace(args[0])
 		if !isLikelyEmailToken(email) {
 			return "Invalid email"
 		}
+		planID := strings.TrimSpace(args[1])
 		note := ""
-		if len(args) > 1 {
-			note = strings.Join(args[1:], " ")
+		if len(args) > 2 {
+			note = strings.Join(args[2:], " ")
 		}
-		detail := fmt.Sprintf("email=%s note=%s", strings.ToLower(email), strings.TrimSpace(note))
-		_ = b.store.InsertAuditLog(ctx, actor, "recharge_request_placeholder", detail)
-		return "Recharge request recorded (placeholder). Payment integration not enabled yet."
+		item, err := b.store.CreatePurchaseRequest(ctx, email, planID, note, actor)
+		if err != nil {
+			return "Failed: " + err.Error()
+		}
+		detail := fmt.Sprintf("id=%d email=%s plan=%s", item.ID, item.RequesterEmail, strings.TrimSpace(item.PlanID))
+		_ = b.store.InsertAuditLog(ctx, actor, "purchase_request_create", detail)
+		return fmt.Sprintf("Purchase request submitted. id=%d status=%s", item.ID, item.Status)
 	case "/sync_now":
 		if err := b.manager.ForceSync(ctx); err != nil {
 			return "Sync failed: " + err.Error()

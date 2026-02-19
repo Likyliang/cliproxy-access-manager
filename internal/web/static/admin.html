@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Admin Dashboard</title>
+  <link rel="stylesheet" href="/web/static/common.css" />
+</head>
+<body>
+  <div class="container">
+    <div class="card">
+      <div class="row" style="justify-content: space-between;">
+        <h2>Admin Dashboard</h2>
+        <div class="row">
+          <a href="/web/login">Login</a>
+          <a href="/web/user">User</a>
+          <button id="logout">Logout</button>
+        </div>
+      </div>
+      <div id="session" class="muted"></div>
+    </div>
+
+    <div class="card">
+      <h3>Global usage overview</h3>
+      <div class="row">
+        <label>Since <input id="since" value="24h" /></label>
+        <button id="refresh" class="primary">Refresh</button>
+      </div>
+      <div id="totals" class="grid"></div>
+    </div>
+
+    <div class="card">
+      <h3>Top users</h3>
+      <table>
+        <thead><tr><th>Email</th><th>Requests</th><th>Failed</th><th>Tokens</th><th>Keys</th></tr></thead>
+        <tbody id="topUsers"></tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h3>Top keys</h3>
+      <table>
+        <thead><tr><th>Key</th><th>Requests</th><th>Failed</th><th>Tokens</th></tr></thead>
+        <tbody id="topKeys"></tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h3>Purchase requests</h3>
+      <div class="row">
+        <select id="purchaseStatus">
+          <option value="">all</option>
+          <option value="pending">pending</option>
+          <option value="approved">approved</option>
+          <option value="rejected">rejected</option>
+          <option value="fulfilled">fulfilled</option>
+          <option value="cancelled">cancelled</option>
+        </select>
+        <button id="loadPurchases">Reload</button>
+      </div>
+      <table>
+        <thead>
+          <tr><th>ID</th><th>Email</th><th>Status</th><th>Plan</th><th>Note</th><th>Review</th><th>Action</th></tr>
+        </thead>
+        <tbody id="purchaseRows"></tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h3>Usage controls</h3>
+      <div class="row">
+        <button id="loadControls">Reload</button>
+        <button id="evaluateNow" class="danger">Evaluate Now</button>
+      </div>
+      <table>
+        <thead><tr><th>ID</th><th>Scope</th><th>Window(s)</th><th>Req</th><th>Tok</th><th>Action</th><th>Enabled</th><th>Note</th></tr></thead>
+        <tbody id="controls"></tbody>
+      </table>
+      <h4>Create control</h4>
+      <div class="row">
+        <select id="cScopeType">
+          <option value="global">global</option>
+          <option value="user">user</option>
+          <option value="key">key</option>
+        </select>
+        <input id="cScopeValue" placeholder="scope value(email/key)" style="min-width: 220px;" />
+        <input id="cWindow" placeholder="window_seconds" value="86400" />
+        <input id="cMaxReq" placeholder="max_requests" />
+        <input id="cMaxTok" placeholder="max_tokens" />
+        <select id="cAction">
+          <option value="audit_only">audit_only</option>
+          <option value="disable_key">disable_key</option>
+          <option value="disable_user_keys">disable_user_keys</option>
+          <option value="disable_all_keys">disable_all_keys</option>
+        </select>
+        <label><input type="checkbox" id="cEnabled" checked /> enabled</label>
+        <input id="cNote" placeholder="note" style="min-width: 200px;" />
+        <button id="createControl" class="primary">Create</button>
+      </div>
+      <p id="controlMsg" class="msg"></p>
+    </div>
+  </div>
+
+  <script src="/web/static/common.js"></script>
+  <script>
+    const { q, on, api, requireSession, logout, htmlEscape, fmtNum } = window.APIMWeb;
+
+    function valIntOrNull(v) {
+      const raw = String(v ?? '').trim();
+      if (!raw) return null;
+      const n = Number(raw);
+      if (!Number.isFinite(n) || n <= 0) return null;
+      return Math.trunc(n);
+    }
+
+    async function loadOverview() {
+      const since = q('since').value || '24h';
+      const data = await api(`/api/v1/admin/usage/overview?since=${encodeURIComponent(since)}`);
+      const totals = data.totals || {};
+      q('totals').innerHTML = [
+        `<div class="card"><div class="muted">Requests</div><div>${fmtNum(totals.total_requests || 0)}</div></div>`,
+        `<div class="card"><div class="muted">Failed</div><div>${fmtNum(totals.failed_requests || 0)}</div></div>`,
+        `<div class="card"><div class="muted">Tokens</div><div>${fmtNum(totals.total_tokens || 0)}</div></div>`,
+      ].join('');
+
+      q('topUsers').innerHTML = (data.top_users || []).map((u) => `
+        <tr>
+          <td class="code">${htmlEscape(u.email)}</td>
+          <td>${fmtNum(u.total_requests || 0)}</td>
+          <td>${fmtNum(u.failed_requests || 0)}</td>
+          <td>${fmtNum(u.total_tokens || 0)}</td>
+          <td>${fmtNum((u.keys || []).length)}</td>
+        </tr>
+      `).join('') || '<tr><td colspan="5" class="muted">No data</td></tr>';
+
+      q('topKeys').innerHTML = (data.top_keys || []).map((k) => `
+        <tr>
+          <td class="code">${htmlEscape(k.api_key)}</td>
+          <td>${fmtNum(k.total_requests || 0)}</td>
+          <td>${fmtNum(k.failed_requests || 0)}</td>
+          <td>${fmtNum(k.total_tokens || 0)}</td>
+        </tr>
+      `).join('') || '<tr><td colspan="4" class="muted">No data</td></tr>';
+    }
+
+    async function loadPurchases() {
+      const status = q('purchaseStatus').value || '';
+      const query = status ? `?status=${encodeURIComponent(status)}` : '';
+      const data = await api(`/api/v1/admin/purchase-requests${query}`);
+      q('purchaseRows').innerHTML = (data.items || []).map((item) => `
+        <tr>
+          <td>${item.id}</td>
+          <td class="code">${htmlEscape(item.requester_email || '')}</td>
+          <td>${htmlEscape(item.status || '')}</td>
+          <td>${htmlEscape(item.plan_id || item.plan || '')}</td>
+          <td>${htmlEscape(item.note || '')}</td>
+          <td>${htmlEscape(item.review_note || '')}</td>
+          <td>
+            <div class="row">
+              <button data-action="approved" data-id="${item.id}">Approve</button>
+              <button data-action="rejected" data-id="${item.id}">Reject</button>
+              <button data-action="fulfilled" data-id="${item.id}">Fulfill</button>
+            </div>
+          </td>
+        </tr>
+      `).join('') || '<tr><td colspan="7" class="muted">No requests</td></tr>';
+
+      q('purchaseRows').querySelectorAll('button[data-action]').forEach((btn) => {
+        btn.addEventListener('click', async () => {
+          const id = Number(btn.getAttribute('data-id'));
+          const status = btn.getAttribute('data-action');
+          const reviewNote = prompt('Review note (optional):') || '';
+          try {
+            await api('/api/v1/admin/purchase-requests', {
+              method: 'PATCH',
+              body: JSON.stringify({ id, status, review_note: reviewNote }),
+            });
+            await loadPurchases();
+          } catch (e) {
+            q('session').textContent = `Update purchase failed: ${e.message}`;
+          }
+        });
+      });
+    }
+
+    async function loadControls() {
+      const data = await api('/api/v1/admin/usage-controls');
+      q('controls').innerHTML = (data.items || []).map((c) => `
+        <tr>
+          <td>${c.id}</td>
+          <td>${htmlEscape(c.scope_type)}:${htmlEscape(c.scope_value || '')}</td>
+          <td>${fmtNum(c.window_seconds)}</td>
+          <td>${c.max_requests == null ? '∞' : fmtNum(c.max_requests)}</td>
+          <td>${c.max_tokens == null ? '∞' : fmtNum(c.max_tokens)}</td>
+          <td>${htmlEscape(c.action)}</td>
+          <td>${c.enabled ? 'yes' : 'no'}</td>
+          <td>${htmlEscape(c.note || '')}</td>
+        </tr>
+      `).join('') || '<tr><td colspan="8" class="muted">No controls</td></tr>';
+    }
+
+    async function createControl() {
+      const payload = {
+        scope_type: q('cScopeType').value,
+        scope_value: q('cScopeValue').value || '',
+        window_seconds: Number(q('cWindow').value || 0),
+        max_requests: valIntOrNull(q('cMaxReq').value),
+        max_tokens: valIntOrNull(q('cMaxTok').value),
+        action: q('cAction').value,
+        enabled: q('cEnabled').checked,
+        note: q('cNote').value || '',
+      };
+      const data = await api('/api/v1/admin/usage-controls', { method: 'POST', body: JSON.stringify(payload) });
+      q('controlMsg').textContent = `Created control #${data.item.id}`;
+      await loadControls();
+    }
+
+    async function evaluateNow() {
+      const data = await api('/api/v1/admin/usage-controls/evaluate-now', { method: 'POST' });
+      q('controlMsg').textContent = `Evaluation done. results=${(data.results || []).length} keys_synced=${data.keys_synced}`;
+    }
+
+    async function main() {
+      try {
+        const principal = await requireSession(['admin']);
+        q('session').textContent = `role=${principal.role} email=${principal.email || '-'}`;
+      } catch (e) {
+        q('session').textContent = `Session error: ${e.message}`;
+        return;
+      }
+
+      on(q('refresh'), 'click', () => loadOverview().catch((e) => q('session').textContent = `Load failed: ${e.message}`));
+      on(q('logout'), 'click', () => logout().then(() => window.location.assign('/web/login')).catch((e) => { q('session').textContent = `Logout failed: ${e.message}`; }));
+      on(q('loadPurchases'), 'click', () => loadPurchases().catch((e) => q('session').textContent = `Load failed: ${e.message}`));
+      on(q('loadControls'), 'click', () => loadControls().catch((e) => q('session').textContent = `Load failed: ${e.message}`));
+      on(q('createControl'), 'click', () => createControl().catch((e) => q('controlMsg').textContent = `Create failed: ${e.message}`));
+      on(q('evaluateNow'), 'click', () => evaluateNow().catch((e) => q('controlMsg').textContent = `Evaluate failed: ${e.message}`));
+
+      await loadOverview();
+      await loadPurchases();
+      await loadControls();
+    }
+
+    main();
+  </script>
+</body>
+</html>

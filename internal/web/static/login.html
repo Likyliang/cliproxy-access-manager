@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>API Manager Login</title>
+  <link rel="stylesheet" href="/web/static/common.css" />
+</head>
+<body>
+  <div class="container">
+    <div class="card">
+      <h2>cliproxy-access-manager Web UI</h2>
+      <p class="muted">Use email + password to login or register.</p>
+      <div class="row">
+        <input id="email" type="email" placeholder="Email" style="min-width: 260px;" />
+        <input id="password" type="password" placeholder="Password" style="min-width: 220px;" />
+      </div>
+      <div class="row">
+        <button id="login" class="primary">Login</button>
+        <button id="register">Register</button>
+      </div>
+      <p id="msg" class="msg"></p>
+    </div>
+
+    <div class="card">
+      <h3>Legacy token (optional)</h3>
+      <p class="muted">Compatibility path for existing token identities.</p>
+      <div class="row">
+        <input id="token" type="password" placeholder="Bearer token" style="min-width: 360px;" />
+        <button id="tokenLogin">Use Token</button>
+        <button id="clearToken">Clear Token</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/web/static/common.js"></script>
+  <script>
+    const { q, on, register, login, token, setToken, fetchPrincipal, routeForRole } = window.APIMWeb;
+    const msg = q('msg');
+
+    async function goByRole() {
+      const principal = await fetchPrincipal();
+      if (!principal) throw new Error('missing principal');
+      window.location.assign(routeForRole(principal.role));
+    }
+
+    async function doLogin() {
+      const email = (q('email').value || '').trim();
+      const password = q('password').value || '';
+      if (!email || !password) {
+        msg.textContent = 'Email and password are required.';
+        return;
+      }
+      msg.textContent = 'Logging in...';
+      await login(email, password);
+      await goByRole();
+    }
+
+    async function doRegister() {
+      const email = (q('email').value || '').trim();
+      const password = q('password').value || '';
+      if (!email || !password) {
+        msg.textContent = 'Email and password are required.';
+        return;
+      }
+      msg.textContent = 'Registering...';
+      await register(email, password);
+      await login(email, password);
+      await goByRole();
+    }
+
+    async function doTokenLogin() {
+      const raw = (q('token').value || '').trim();
+      if (!raw) {
+        msg.textContent = 'Token is required.';
+        return;
+      }
+      setToken(raw);
+      msg.textContent = 'Validating token...';
+      await goByRole();
+    }
+
+    async function main() {
+      q('token').value = token();
+      try {
+        await goByRole();
+        return;
+      } catch (_) {}
+
+      on(q('login'), 'click', () => doLogin().catch((e) => { msg.textContent = `Login failed: ${e.message}`; }));
+      on(q('register'), 'click', () => doRegister().catch((e) => { msg.textContent = `Register failed: ${e.message}`; }));
+      on(q('tokenLogin'), 'click', () => doTokenLogin().catch((e) => { msg.textContent = `Token login failed: ${e.message}`; }));
+      on(q('clearToken'), 'click', () => {
+        setToken('');
+        q('token').value = '';
+        msg.textContent = 'Token cleared.';
+      });
+    }
+
+    main();
+  </script>
+</body>
+</html>

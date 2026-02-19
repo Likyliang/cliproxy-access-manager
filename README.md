@@ -6,6 +6,8 @@ Sidecar plugin for CLIProxyAPI that adds:
 - restart recovery for usage statistics
 - Telegram bot operations for key and usage management
 - multi-user identity RBAC for HTTP and Telegram
+- built-in Web UI (`/web`) with user/admin role views
+- purchase request workflow and usage control rules
 
 This plugin is built as a companion extension for the upstream project:
 - https://github.com/router-for-me/CLIProxyAPI
@@ -39,6 +41,10 @@ Recommended:
 - `APIM_DB_PATH` (default `${APIM_DATA_DIR}/apim.db`)
 - `APIM_HTTP_ADDR` (default `127.0.0.1:8390`)
 - `APIM_HTTP_AUTH_TOKEN` (optional bearer token for sidecar HTTP API)
+- `APIM_AUTH_SESSION_TTL` (default `24h`)
+- `APIM_AUTH_COOKIE_NAME` (default `apim_session`)
+- `APIM_AUTH_COOKIE_SECURE` (default `false`, set `true` in production HTTPS)
+- `APIM_ADMIN_EMAIL` / `APIM_ADMIN_PASSWORD` (optional idempotent bootstrap admin account for email login)
 - `APIM_KEY_SYNC_INTERVAL` (default `30s`)
 - `APIM_USAGE_SYNC_INTERVAL` (default `2m`)
 - `APIM_RECOVERY_CHECK_INTERVAL` (default `60s`)
@@ -82,19 +88,28 @@ Identities are stored in SQLite table `auth_identities`:
 - `email`: required for `user`, optional for `admin`
 - `status`: currently active on upsert
 
+Email/password login users are stored in `auth_users` (`email`, `role`, `password_hash`, `status`, ...).
+Browser/API sessions are stored in `auth_sessions` with `session_hash` only (plain session token is never persisted).
+
 Authorization:
 - `healthz` is public.
-- HTTP protected endpoints require either:
-  - bootstrap token (`APIM_HTTP_AUTH_TOKEN`) => admin principal, or
-  - mapped identity in `auth_identities`.
+- HTTP protected endpoints resolve principal in this order:
+  1) session cookie (`APIM_AUTH_COOKIE_NAME`)
+  2) legacy token (`Authorization` / `X-APIM-Token`):
+     - bootstrap token (`APIM_HTTP_AUTH_TOKEN`) => admin principal
+     - mapped identity in `auth_identities`
 - Telegram requires **allowlist pass + identity mapping**.
 
 Permission matrix:
 - `admin`:
   - HTTP: all existing management endpoints + `/identities`
+  - HTTP v1: all `/api/v1/admin/*`
+  - Web UI: `/web/admin`
   - Telegram: all management commands
 - `user`:
-  - HTTP: only `GET /me`
+  - HTTP: `GET /me`
+  - HTTP v1: `/api/v1/session`, `/api/v1/user/*`, `/api/v1/purchase-requests*` (self only)
+  - Web UI: `/web/user`
   - Telegram: `/help`, `/start`, `/me` (self only)
 
 ## Telegram commands
@@ -128,6 +143,7 @@ TTL examples:
 
 ## HTTP API
 
+Legacy endpoints (kept for compatibility):
 - `GET /healthz`
 - `GET /status`
 - `POST /sync_now`
@@ -146,21 +162,132 @@ TTL examples:
 - `GET /identities?provider=http|telegram` (admin)
 - `POST /identities` (admin)
 - `DELETE /identities?provider=...&subject=...` (admin)
-- `POST /recharge/request` (placeholder)
+- `POST /recharge/request` (now creates a purchase request record)
 
-When authenticating to HTTP API, pass token via:
+Web/UI API v1:
+- Auth/session:
+  - `POST /api/v1/auth/register` (email+password, creates `role=user` only)
+  - `POST /api/v1/auth/login` (email+password, sets HttpOnly session cookie)
+  - `POST /api/v1/auth/logout` (revoke current session + clear cookie)
+  - `GET /api/v1/auth/me` (resolved principal)
+  - `GET /api/v1/session` (compatibility alias for resolved principal)
+- User (`requireUser` and server-side self-scope):
+  - `GET /api/v1/user/keys?since=24h|7d|<duration>`
+  - `GET /api/v1/user/usage?since=24h|7d|<duration>`
+  - `POST /api/v1/purchase-requests`
+  - `GET /api/v1/purchase-requests/mine?limit=<n>`
+- Admin (`requireAdmin`):
+  - `GET /api/v1/admin/usage/overview?since=24h|7d|<duration>`
+  - `GET /api/v1/admin/usage/users?since=24h|7d|<duration>&limit=<n>`
+  - `GET /api/v1/admin/usage/users/{email}?since=24h|7d|<duration>`
+  - `GET|PATCH /api/v1/admin/purchase-requests`
+  - `GET|POST|PATCH /api/v1/admin/usage-controls`
+  - `POST /api/v1/admin/usage-controls/evaluate-now`
+  - `GET|POST|DELETE /api/v1/admin/identities` (forwarded to legacy)
+  - `GET|POST|DELETE /api/v1/admin/keys` and `/api/v1/admin/keys/*` (forwarded to legacy)
+
+Built-in Web UI routes:
+- `GET /web` / `GET /web/login` (unified login/register page)
+- `GET /web/user`
+- `GET /web/admin`
+- `GET /web/static/*`
+
+Web UI behavior:
+- Login/register happens on `/web/login`.
+- Successful login checks `/api/v1/auth/me` and auto-routes by role:
+  - `admin -> /web/admin`
+  - `user -> /web/user`
+- `user/admin` pages validate role and redirect to matching page or `/web/login`.
+- Logout button calls `/api/v1/auth/logout`.
+
+For browser/Web UI, authenticate with session cookie set by `/api/v1/auth/login`.
+
+For legacy script/API authentication, pass token via:
 - `Authorization: Bearer <token>`
 or
 - `X-APIM-Token: <token>`
 
 Notes:
 - `APIM_HTTP_AUTH_TOKEN` acts as a bootstrap admin token for compatibility.
-- Additional principals are managed via `/identities`.
+- Additional token principals are managed via `/identities`.
 - For `provider=http`, `/identities` accepts plaintext token in `subject` and stores SHA-256 only.
 
 When `APIM_HTTP_UPDATE_REQUIRE_AUTH=true` and `APIM_HTTP_AUTH_TOKEN` is empty:
 - `/update/check` and `/update/apply` are rejected (403)
 - this enforces explicit auth configuration before exposing update actions
+
+## Usage control semantics
+
+Usage controls are local policy rules evaluated against persisted usage snapshots:
+- scope: `global` | `user` | `key`
+- thresholds: `max_requests` and/or `max_tokens` over `window_seconds`
+- actions:
+  - `audit_only`: write events/audit only
+  - `disable_key`: disable target key
+  - `disable_user_keys`: disable all keys under a target email
+  - `disable_all_keys`: emergency disable all keys
+
+When action disables keys, sidecar syncs active key set to CLIProxyAPI through existing `/v0/management/api-keys` reconciliation.
+
+For Web/UI responses, `remaining` is computed only when a matching enabled control exists.
+If no control applies, remaining fields are `null` and UI should treat as unconfigured/unlimited.
+
+### Quick interaction checklist (curl)
+
+`cliproxy-access-manager` now ships a built-in web UI at `/web` (login/user/admin pages). You can still use HTTP API or Telegram bot for automation.
+
+```bash
+# 0) set your base URL and admin token
+export APIM_BASE_URL="https://apimanager.example.com"
+export APIM_TOKEN="<your_apim_http_auth_token_or_admin_identity_token>"
+
+# 1) health check (public)
+curl -i "$APIM_BASE_URL/healthz"
+
+# 2) admin status
+curl -i -H "Authorization: Bearer $APIM_TOKEN" "$APIM_BASE_URL/status"
+
+# 3) trigger immediate reconciliation
+curl -i -X POST -H "Authorization: Bearer $APIM_TOKEN" "$APIM_BASE_URL/sync_now"
+
+# 4) list keys
+curl -i -H "Authorization: Bearer $APIM_TOKEN" "$APIM_BASE_URL/keys?filter=all"
+
+# 5) add a key
+curl -i -X POST \
+  -H "Authorization: Bearer $APIM_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"key":"demo-key-001","owner_email":"user@example.com","ttl":"7d","note":"demo"}' \
+  "$APIM_BASE_URL/keys"
+
+# 6) disable a key
+curl -i -X PATCH \
+  -H "Authorization: Bearer $APIM_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"key":"demo-key-001","status":"disabled"}' \
+  "$APIM_BASE_URL/keys/status"
+
+# 7) create HTTP user identity (RBAC)
+curl -i -X POST \
+  -H "Authorization: Bearer $APIM_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"provider":"http","subject":"user-http-token","role":"user","email":"user@example.com"}' \
+  "$APIM_BASE_URL/identities"
+
+# 8) list identities
+curl -i -H "Authorization: Bearer $APIM_TOKEN" "$APIM_BASE_URL/identities?provider=http"
+
+# 9) user self query (with user token)
+curl -i -H "Authorization: Bearer user-http-token" "$APIM_BASE_URL/me?since=24h"
+
+# 10) admin query by email
+curl -i -H "Authorization: Bearer $APIM_TOKEN" "$APIM_BASE_URL/account/query?email=user@example.com&since=7d"
+```
+
+Notes:
+- You can also pass token with `X-APIM-Token: <token>`.
+- For `provider=http`, `subject` accepts plaintext token in request; only SHA-256 is stored.
+- `GET /` is not an API endpoint; use `/healthz` or other explicit paths.
 
 ### RBAC smoke test (HTTP)
 

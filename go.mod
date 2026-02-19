@@ -2,7 +2,10 @@ module github.com/router-for-me/CLIProxyAPI/v6/plugins/cliproxy-access-manager
 
 go 1.24.0
 
-require modernc.org/sqlite v1.39.1
+require (
+	golang.org/x/mod v0.27.0
+	modernc.org/sqlite v1.39.1
+)
 
 require (
 	github.com/dustin/go-humanize v1.0.1 // indirect
