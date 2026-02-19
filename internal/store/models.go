@@ -5,6 +5,15 @@ import "time"
 const (
 	KeyStatusActive   = "active"
 	KeyStatusDisabled = "disabled"
+
+	IdentityProviderHTTP     = "http"
+	IdentityProviderTelegram = "telegram"
+
+	IdentityRoleAdmin = "admin"
+	IdentityRoleUser  = "user"
+
+	IdentityStatusActive   = "active"
+	IdentityStatusDisabled = "disabled"
 )
 
 // APIKey represents a managed inbound API key metadata row.
@@ -64,6 +73,28 @@ type AccountSummary struct {
 	ValidDays      int64
 	Unlimited      bool
 	ValidUntil     *time.Time
+}
+
+// Identity maps external auth principals to role/email.
+type Identity struct {
+	ID        int64
+	Provider  string
+	Subject   string
+	Role      string
+	Email     string
+	Status    string
+	Note      string
+	CreatedBy string
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
+// Principal is a resolved request identity.
+type Principal struct {
+	Provider string
+	Subject  string
+	Role     string
+	Email    string
 }
 
 // AuditLog records operator and background actions.

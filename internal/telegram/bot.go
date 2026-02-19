@@ -25,23 +25,25 @@ type Bot struct {
 	manager    *reconcile.Manager
 	interval   time.Duration
 
-	allowedChats map[int64]struct{}
-	allowedUsers map[int64]struct{}
-	offset       int64
+	allowedChats                   map[int64]struct{}
+	allowedUsers                   map[int64]struct{}
+	denyHighRiskWhenAllowlistEmpty bool
+	offset                         int64
 }
 
-func New(token string, pollInterval time.Duration, allowedChatIDs, allowedUserIDs []int64, s *store.Store, m *reconcile.Manager) *Bot {
+func New(token string, pollInterval time.Duration, allowedChatIDs, allowedUserIDs []int64, denyHighRiskWhenAllowlistEmpty bool, s *store.Store, m *reconcile.Manager) *Bot {
 	if pollInterval <= 0 {
 		pollInterval = 3 * time.Second
 	}
 	b := &Bot{
-		token:        strings.TrimSpace(token),
-		http:         &http.Client{Timeout: 25 * time.Second},
-		store:        s,
-		manager:      m,
-		interval:     pollInterval,
-		allowedChats: make(map[int64]struct{}, len(allowedChatIDs)),
-		allowedUsers: make(map[int64]struct{}, len(allowedUserIDs)),
+		token:                          strings.TrimSpace(token),
+		http:                           &http.Client{Timeout: 25 * time.Second},
+		store:                          s,
+		manager:                        m,
+		interval:                       pollInterval,
+		allowedChats:                   make(map[int64]struct{}, len(allowedChatIDs)),
+		allowedUsers:                   make(map[int64]struct{}, len(allowedUserIDs)),
+		denyHighRiskWhenAllowlistEmpty: denyHighRiskWhenAllowlistEmpty,
 	}
 	for _, id := range allowedChatIDs {
 		b.allowedChats[id] = struct{}{}
@@ -177,11 +179,21 @@ func (b *Bot) handleMessage(ctx context.Context, msg *messageBody) {
 		_ = b.sendMessage(ctx, chatID, "Access denied.")
 		return
 	}
+	principal, err := b.store.ResolveTelegramPrincipal(ctx, userID)
+	if err != nil {
+		log.Printf("[WARN] resolve telegram principal failed for user %d: %v", userID, err)
+		_ = b.sendMessage(ctx, chatID, "Authorization lookup failed.")
+		return
+	}
+	if principal == nil {
+		_ = b.sendMessage(ctx, chatID, "Access denied.")
+		return
+	}
 	text := strings.TrimSpace(msg.Text)
 	if text == "" || !strings.HasPrefix(text, "/") {
 		return
 	}
-	response := b.executeCommand(ctx, text, chatID, userID)
+	response := b.executeCommand(ctx, text, chatID, userID, principal)
 	if strings.TrimSpace(response) != "" {
 		_ = b.sendMessage(ctx, chatID, response)
 	}
@@ -199,17 +211,51 @@ func (b *Bot) isAllowed(chatID, userID int64) bool {
 	return chatAllowed && userAllowed
 }
 
-func (b *Bot) executeCommand(ctx context.Context, text string, chatID, userID int64) string {
+func (b *Bot) executeCommand(ctx context.Context, text string, chatID, userID int64, principal *store.Principal) string {
 	parts := strings.Fields(text)
 	if len(parts) == 0 {
 		return ""
 	}
 	cmd := strings.ToLower(parts[0])
 	args := parts[1:]
-	actor := fmt.Sprintf("tg:user=%d,chat=%d", userID, chatID)
+	if principal == nil {
+		return "Access denied."
+	}
+	role := strings.ToLower(strings.TrimSpace(principal.Role))
+	isAdmin := role == store.IdentityRoleAdmin
+	isUser := role == store.IdentityRoleUser
+	if !isAdmin && !isUser {
+		return "Access denied."
+	}
+	if !isAdmin {
+		switch cmd {
+		case "/help", "/start", "/me":
+		default:
+			return "Access denied."
+		}
+	}
+	actor := fmt.Sprintf("tg:user=%d,chat=%d,role=%s", userID, chatID, role)
+	if email := strings.TrimSpace(principal.Email); email != "" {
+		actor += ",email=" + strings.ToLower(email)
+	}
+
+	if b.shouldDenyHighRiskCommand(cmd) {
+		reason := fmt.Sprintf("high-risk command denied: %s", cmd)
+		if b.store != nil {
+			_ = b.store.InsertAuditLog(ctx, actor, "telegram_high_risk_command_denied", reason)
+		}
+		return "Access denied: high-risk commands require explicit allowlist configuration."
+	}
 
 	switch cmd {
 	case "/help", "/start":
+		if !isAdmin {
+			return strings.Join([]string{
+				"Commands:",
+				"/me [24h|7d|duration]",
+				"(your own account only)",
+			}, "\n")
+		}
 		return strings.Join([]string{
 			"Commands:",
 			"/key_add <key> <email> <ttl|expires_at> [note]",
@@ -406,20 +452,39 @@ func (b *Bot) executeCommand(ctx context.Context, text string, chatID, userID in
 		}
 		return strings.Join(lines, "\n")
 	case "/me":
-		if len(args) < 1 {
-			return "Usage: /me <email> [24h|7d|duration]"
-		}
-		email := strings.TrimSpace(args[0])
-		if !isLikelyEmailToken(email) {
-			return "Invalid email"
-		}
 		since := time.Now().UTC().Add(-24 * time.Hour)
-		if len(args) > 1 {
-			parsed, err := parseSinceToken(args[1])
-			if err != nil {
-				return "Invalid duration: " + err.Error()
+		email := ""
+		if isAdmin {
+			if len(args) < 1 {
+				return "Usage: /me <email> [24h|7d|duration]"
 			}
-			since = parsed
+			email = strings.TrimSpace(args[0])
+			if !isLikelyEmailToken(email) {
+				return "Invalid email"
+			}
+			if len(args) > 1 {
+				parsed, err := parseSinceToken(args[1])
+				if err != nil {
+					return "Invalid duration: " + err.Error()
+				}
+				since = parsed
+			}
+		} else {
+			email = strings.TrimSpace(principal.Email)
+			if !isLikelyEmailToken(email) {
+				return "No email bound to your account."
+			}
+			if len(args) > 0 {
+				first := strings.TrimSpace(args[0])
+				if strings.Contains(first, "@") {
+					return "You can only query your own account. Use /me [24h|7d|duration]."
+				}
+				parsed, err := parseSinceToken(first)
+				if err != nil {
+					return "Invalid duration: " + err.Error()
+				}
+				since = parsed
+			}
 		}
 		summary, err := b.store.AccountSummarySince(ctx, email, since, time.Now().UTC())
 		if err != nil {
@@ -651,4 +716,29 @@ func isLikelyEmailToken(raw string) bool {
 		return false
 	}
 	return true
+}
+
+func (b *Bot) shouldDenyHighRiskCommand(cmd string) bool {
+	if b == nil {
+		return false
+	}
+	if !b.denyHighRiskWhenAllowlistEmpty {
+		return false
+	}
+	if len(b.allowedChats) != 0 || len(b.allowedUsers) != 0 {
+		return false
+	}
+	if !isHighRiskCommand(cmd) {
+		return false
+	}
+	return true
+}
+
+func isHighRiskCommand(cmd string) bool {
+	switch strings.ToLower(strings.TrimSpace(cmd)) {
+	case "/update_apply", "/sync_now", "/usage_sync_now", "/key_add", "/key_extend", "/key_disable", "/key_enable", "/key_delete":
+		return true
+	default:
+		return false
+	}
 }

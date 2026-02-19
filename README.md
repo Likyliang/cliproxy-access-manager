@@ -5,6 +5,7 @@ Sidecar plugin for CLIProxyAPI that adds:
 - durable usage snapshot persistence
 - restart recovery for usage statistics
 - Telegram bot operations for key and usage management
+- multi-user identity RBAC for HTTP and Telegram
 
 This plugin is built as a companion extension for the upstream project:
 - https://github.com/router-for-me/CLIProxyAPI
@@ -53,14 +54,52 @@ Main-project update tracking/control:
 - `APIM_UPDATE_CHECK_TIME` (default `04:00`, UTC)
 - current CLIProxyAPI version is auto-detected from management response header `X-CPA-VERSION`
 - `APIM_MANAGEMENT_LATEST_VERSION_URL` (default `/v0/management/latest-version`)
-- `APIM_UPDATE_APPLY_COMMAND` (optional; if empty, sidecar uses automatic docker compose update mode)
+- semver comparison is used (`latest > current` only)
+- `APIM_UPDATE_AUTO_APPLY_ENABLED` (default `false`; when enabled, apply is triggered automatically after `update_available`)
+- `APIM_UPDATE_APPLY_COMMAND` (optional custom apply command)
+- `APIM_UPDATE_ALLOW_CUSTOM_COMMAND` (default `false`; must be true to allow `APIM_UPDATE_APPLY_COMMAND`)
 - `APIM_AUTO_UPDATE_ENABLED` (default `true`)
 - `APIM_AUTO_UPDATE_SERVICE` (default `cliproxy`)
 - `APIM_AUTO_UPDATE_COMPOSE_FILE` (optional absolute compose file path)
 - `APIM_AUTO_UPDATE_WORKING_DIR` (optional working directory for compose lookup)
 
+Security hardening:
+- `APIM_HTTP_UPDATE_REQUIRE_AUTH` (default `true`; blocks `/update/check` and `/update/apply` when `APIM_HTTP_AUTH_TOKEN` is empty)
+- `APIM_TELEGRAM_DENY_HIGH_RISK_WHEN_ALLOWLIST_EMPTY` (default `true`; deny high-risk write/update commands if Telegram allowlist is empty)
+
+Recovery hardening:
+- `APIM_DB_RECOVER_ON_CORRUPT` (default `true`; backup corrupt DB and recreate)
+- `APIM_RECOVERY_SNAPSHOT_SCAN_LIMIT` (default `10`; fallback scan depth for recovery snapshots)
+
+## RBAC model
+
+Identities are stored in SQLite table `auth_identities`:
+- `provider`: `http` or `telegram`
+- `subject`:
+  - `http`: SHA-256 of token
+  - `telegram`: Telegram user id string
+- `role`: `admin` or `user`
+- `email`: required for `user`, optional for `admin`
+- `status`: currently active on upsert
+
+Authorization:
+- `healthz` is public.
+- HTTP protected endpoints require either:
+  - bootstrap token (`APIM_HTTP_AUTH_TOKEN`) => admin principal, or
+  - mapped identity in `auth_identities`.
+- Telegram requires **allowlist pass + identity mapping**.
+
+Permission matrix:
+- `admin`:
+  - HTTP: all existing management endpoints + `/identities`
+  - Telegram: all management commands
+- `user`:
+  - HTTP: only `GET /me`
+  - Telegram: `/help`, `/start`, `/me` (self only)
+
 ## Telegram commands
 
+Admin:
 - `/help`
 - `/key_add <key> <email> <ttl|expires_at> [note]`
 - `/key_extend <key> <ttl|expires_at>`
@@ -75,6 +114,11 @@ Main-project update tracking/control:
 - `/status`
 - `/update_check`
 - `/update_apply`
+
+User:
+- `/help`
+- `/start`
+- `/me [24h|7d|duration]`
 
 TTL examples:
 - `24h`
@@ -97,13 +141,67 @@ TTL examples:
 - `PATCH /keys/expiry`
 - `GET /usage/top?since=24h|7d|<duration>`
 - `GET /usage/key?key=<api-key>&since=24h|7d|<duration>`
-- `GET /account/query?email=<email>&since=24h|7d|<duration>`
+- `GET /account/query?email=<email>&since=24h|7d|<duration>` (admin)
+- `GET /me?since=24h|7d|<duration>` (user self, also available to admin if email is bound)
+- `GET /identities?provider=http|telegram` (admin)
+- `POST /identities` (admin)
+- `DELETE /identities?provider=...&subject=...` (admin)
 - `POST /recharge/request` (placeholder)
 
-When `APIM_HTTP_AUTH_TOKEN` is set, pass token via:
+When authenticating to HTTP API, pass token via:
 - `Authorization: Bearer <token>`
 or
 - `X-APIM-Token: <token>`
+
+Notes:
+- `APIM_HTTP_AUTH_TOKEN` acts as a bootstrap admin token for compatibility.
+- Additional principals are managed via `/identities`.
+- For `provider=http`, `/identities` accepts plaintext token in `subject` and stores SHA-256 only.
+
+When `APIM_HTTP_UPDATE_REQUIRE_AUTH=true` and `APIM_HTTP_AUTH_TOKEN` is empty:
+- `/update/check` and `/update/apply` are rejected (403)
+- this enforces explicit auth configuration before exposing update actions
+
+### RBAC smoke test (HTTP)
+
+Example (real smoke run):
+
+```bash
+# 1) bootstrap admin token can access admin endpoint
+curl -i -H "Authorization: Bearer bootstrap-smoke-token" http://127.0.0.1:18439/status
+# -> 200
+
+# 2) unauthenticated request is rejected
+curl -i http://127.0.0.1:18439/status
+# -> 401
+
+# 3) create admin/user HTTP identities
+curl -i -H "Authorization: Bearer bootstrap-smoke-token" -H "Content-Type: application/json" \
+  -d '{"provider":"http","subject":"admin-http-token","role":"admin","email":"admin@example.com"}' \
+  http://127.0.0.1:18439/identities
+# -> 200
+
+curl -i -H "Authorization: Bearer bootstrap-smoke-token" -H "Content-Type: application/json" \
+  -d '{"provider":"http","subject":"user-http-token","role":"user","email":"user@example.com"}' \
+  http://127.0.0.1:18439/identities
+# -> 200
+
+# 4) user token cannot access admin-only endpoint
+curl -i -H "Authorization: Bearer user-http-token" http://127.0.0.1:18439/keys
+# -> 403
+
+# 5) user token can query self summary
+curl -i -H "Authorization: Bearer user-http-token" "http://127.0.0.1:18439/me?since=24h"
+# -> 200
+
+# 6) user token cannot manage identities
+curl -i -H "Authorization: Bearer user-http-token" "http://127.0.0.1:18439/identities?provider=http"
+# -> 403
+
+# 7) unknown token is rejected
+curl -i -H "Authorization: Bearer no-such-token" http://127.0.0.1:18439/status
+# -> 401
+```
 
 ## Build (local Go)
 

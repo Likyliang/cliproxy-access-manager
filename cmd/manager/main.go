@@ -27,7 +27,7 @@ func main() {
 		log.Fatalf("load config failed: %v", err)
 	}
 
-	s, err := store.Open(cfg.DatabasePath)
+	s, err := store.OpenWithRecovery(cfg.DatabasePath, cfg.DBRecoverOnCorrupt)
 	if err != nil {
 		log.Fatalf("open store failed: %v", err)
 	}
@@ -48,11 +48,22 @@ func main() {
 		cfg.UpdateCheckTime,
 		cfg.ManagementLatestVersionURL,
 		cfg.UpdateApplyCommand,
+		cfg.UpdateAutoApplyEnabled,
+		cfg.UpdateAllowCustomCommand,
+		cfg.RecoverySnapshotScanLimit,
 	)
 	if err := reconciler.RecoverIfNeeded(context.Background()); err != nil {
-		log.Printf("[WARN] initial recovery import failed: %v", err)
+		log.Fatalf("initial recovery import failed: %v", err)
 	}
-	bot := telegram.New(cfg.TelegramBotToken, cfg.TelegramPollInterval, cfg.TelegramAllowedChatIDs, cfg.TelegramAllowedUserIDs, s, reconciler)
+	bot := telegram.New(
+		cfg.TelegramBotToken,
+		cfg.TelegramPollInterval,
+		cfg.TelegramAllowedChatIDs,
+		cfg.TelegramAllowedUserIDs,
+		cfg.TelegramDenyHighRiskWhenAllowlistEmpty,
+		s,
+		reconciler,
+	)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
@@ -87,19 +98,102 @@ func main() {
 
 func buildHTTPServer(cfg cfgpkg.Config, s *store.Store, reconciler *reconcile.Manager) *http.Server {
 	mux := http.NewServeMux()
-	withAuth := func(next http.HandlerFunc) http.HandlerFunc {
+	type principalHandler func(http.ResponseWriter, *http.Request, *store.Principal)
+
+	principalActor := func(principal *store.Principal) string {
+		if principal == nil {
+			return "http"
+		}
+		email := strings.TrimSpace(principal.Email)
+		if email != "" {
+			return fmt.Sprintf("http:role=%s,subject=%s,email=%s", principal.Role, principal.Subject, email)
+		}
+		return fmt.Sprintf("http:role=%s,subject=%s", principal.Role, principal.Subject)
+	}
+
+	auditIdentitySubject := func(provider, subject string) string {
+		provider = strings.ToLower(strings.TrimSpace(provider))
+		subject = strings.TrimSpace(subject)
+		if provider == store.IdentityProviderHTTP {
+			return "[redacted-http-token]"
+		}
+		return subject
+	}
+
+	identitySubjectView := func(provider, subject string) string {
+		provider = strings.ToLower(strings.TrimSpace(provider))
+		subject = strings.TrimSpace(subject)
+		if provider == store.IdentityProviderHTTP {
+			return "[sha256]"
+		}
+		return subject
+	}
+
+	withPrincipal := func(next principalHandler) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
-			if token := strings.TrimSpace(cfg.HTTPAuthToken); token != "" {
-				provided := extractBearer(r.Header.Get("Authorization"))
-				if provided == "" {
-					provided = strings.TrimSpace(r.Header.Get("X-APIM-Token"))
-				}
-				if provided != token {
-					writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
-					return
-				}
+			provided := extractBearer(r.Header.Get("Authorization"))
+			if provided == "" {
+				provided = strings.TrimSpace(r.Header.Get("X-APIM-Token"))
 			}
-			next(w, r)
+			if provided == "" {
+				writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
+				return
+			}
+
+			bootstrapToken := strings.TrimSpace(cfg.HTTPAuthToken)
+			if bootstrapToken != "" && provided == bootstrapToken {
+				next(w, r, &store.Principal{
+					Provider: store.IdentityProviderHTTP,
+					Subject:  "bootstrap",
+					Role:     store.IdentityRoleAdmin,
+				})
+				return
+			}
+
+			principal, err := s.ResolveHTTPPrincipal(r.Context(), provided)
+			if err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+				return
+			}
+			if principal == nil {
+				writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
+				return
+			}
+			next(w, r, principal)
+		}
+	}
+
+	requireAdmin := func(next principalHandler) http.HandlerFunc {
+		return withPrincipal(func(w http.ResponseWriter, r *http.Request, principal *store.Principal) {
+			if principal == nil || principal.Role != store.IdentityRoleAdmin {
+				writeJSON(w, http.StatusForbidden, map[string]any{"error": "forbidden"})
+				return
+			}
+			next(w, r, principal)
+		})
+	}
+
+	requireUser := func(next principalHandler) http.HandlerFunc {
+		return withPrincipal(func(w http.ResponseWriter, r *http.Request, principal *store.Principal) {
+			if principal == nil {
+				writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
+				return
+			}
+			if principal.Role != store.IdentityRoleAdmin && principal.Role != store.IdentityRoleUser {
+				writeJSON(w, http.StatusForbidden, map[string]any{"error": "forbidden"})
+				return
+			}
+			next(w, r, principal)
+		})
+	}
+
+	withUpdateAdmin := func(next principalHandler) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			if cfg.HTTPUpdateRequireAuth && strings.TrimSpace(cfg.HTTPAuthToken) == "" {
+				writeJSON(w, http.StatusForbidden, map[string]any{"error": "update endpoints require APIM_HTTP_AUTH_TOKEN when APIM_HTTP_UPDATE_REQUIRE_AUTH=true"})
+				return
+			}
+			requireAdmin(next)(w, r)
 		}
 	}
 
@@ -111,7 +205,7 @@ func buildHTTPServer(cfg cfgpkg.Config, s *store.Store, reconciler *reconcile.Ma
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 	})
 
-	mux.HandleFunc("/status", withAuth(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/status", requireAdmin(func(w http.ResponseWriter, r *http.Request, _ *store.Principal) {
 		if r.Method != http.MethodGet {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
 			return
@@ -124,7 +218,7 @@ func buildHTTPServer(cfg cfgpkg.Config, s *store.Store, reconciler *reconcile.Ma
 		writeJSON(w, http.StatusOK, status)
 	}))
 
-	mux.HandleFunc("/update/check", withAuth(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/update/check", withUpdateAdmin(func(w http.ResponseWriter, r *http.Request, principal *store.Principal) {
 		if r.Method != http.MethodPost {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
 			return
@@ -133,12 +227,12 @@ func buildHTTPServer(cfg cfgpkg.Config, s *store.Store, reconciler *reconcile.Ma
 			writeJSON(w, http.StatusBadGateway, map[string]any{"error": err.Error()})
 			return
 		}
-		_ = s.InsertAuditLog(r.Context(), "http", "update_check_manual", "manual trigger")
+		_ = s.InsertAuditLog(r.Context(), principalActor(principal), "update_check_manual", "manual trigger")
 		status, _ := reconciler.Status(r.Context())
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "status": status})
 	}))
 
-	mux.HandleFunc("/update/apply", withAuth(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/update/apply", withUpdateAdmin(func(w http.ResponseWriter, r *http.Request, principal *store.Principal) {
 		if r.Method != http.MethodPost {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
 			return
@@ -148,14 +242,14 @@ func buildHTTPServer(cfg cfgpkg.Config, s *store.Store, reconciler *reconcile.Ma
 			return
 		}
 		if err := reconciler.CheckMainProjectUpdateNow(r.Context()); err != nil {
-			_ = s.InsertAuditLog(r.Context(), "http", "update_check_after_apply_failed", err.Error())
+			_ = s.InsertAuditLog(r.Context(), principalActor(principal), "update_check_after_apply_failed", err.Error())
 		}
-		_ = s.InsertAuditLog(r.Context(), "http", "update_apply_manual", "manual trigger")
+		_ = s.InsertAuditLog(r.Context(), principalActor(principal), "update_apply_manual", "manual trigger")
 		status, _ := reconciler.Status(r.Context())
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "status": status})
 	}))
 
-	mux.HandleFunc("/sync_now", withAuth(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/sync_now", requireAdmin(func(w http.ResponseWriter, r *http.Request, principal *store.Principal) {
 		if r.Method != http.MethodPost {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
 			return
@@ -164,11 +258,11 @@ func buildHTTPServer(cfg cfgpkg.Config, s *store.Store, reconciler *reconcile.Ma
 			writeJSON(w, http.StatusBadGateway, map[string]any{"error": err.Error()})
 			return
 		}
-		_ = s.InsertAuditLog(r.Context(), "http", "sync_now", "manual")
+		_ = s.InsertAuditLog(r.Context(), principalActor(principal), "sync_now", "manual")
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 	}))
 
-	mux.HandleFunc("/usage/sync_now", withAuth(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/usage/sync_now", requireAdmin(func(w http.ResponseWriter, r *http.Request, principal *store.Principal) {
 		if r.Method != http.MethodPost {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
 			return
@@ -177,11 +271,12 @@ func buildHTTPServer(cfg cfgpkg.Config, s *store.Store, reconciler *reconcile.Ma
 			writeJSON(w, http.StatusBadGateway, map[string]any{"error": err.Error()})
 			return
 		}
-		_ = s.InsertAuditLog(r.Context(), "http", "usage_sync_now", "manual")
+		_ = s.InsertAuditLog(r.Context(), principalActor(principal), "usage_sync_now", "manual")
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 	}))
 
-	mux.HandleFunc("/keys", withAuth(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/keys", requireAdmin(func(w http.ResponseWriter, r *http.Request, principal *store.Principal) {
+		actor := principalActor(principal)
 		switch r.Method {
 		case http.MethodGet:
 			items, err := s.ListAPIKeys(r.Context())
@@ -233,7 +328,7 @@ func buildHTTPServer(cfg cfgpkg.Config, s *store.Store, reconciler *reconcile.Ma
 				writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 				return
 			}
-			if err := s.UpsertAPIKey(r.Context(), req.Key, expires, req.OwnerEmail, req.Note, "http"); err != nil {
+			if err := s.UpsertAPIKey(r.Context(), req.Key, expires, req.OwnerEmail, req.Note, actor); err != nil {
 				writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 				return
 			}
@@ -241,7 +336,7 @@ func buildHTTPServer(cfg cfgpkg.Config, s *store.Store, reconciler *reconcile.Ma
 				writeJSON(w, http.StatusBadGateway, map[string]any{"error": "saved but sync failed: " + err.Error()})
 				return
 			}
-			_ = s.InsertAuditLog(r.Context(), "http", "key_add", fmt.Sprintf("key=%s email=%s", strings.TrimSpace(req.Key), strings.ToLower(strings.TrimSpace(req.OwnerEmail))))
+			_ = s.InsertAuditLog(r.Context(), actor, "key_add", fmt.Sprintf("key=%s email=%s", strings.TrimSpace(req.Key), strings.ToLower(strings.TrimSpace(req.OwnerEmail))))
 			writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 		case http.MethodDelete:
 			key := strings.TrimSpace(r.URL.Query().Get("key"))
@@ -262,14 +357,14 @@ func buildHTTPServer(cfg cfgpkg.Config, s *store.Store, reconciler *reconcile.Ma
 				writeJSON(w, http.StatusBadGateway, map[string]any{"error": "deleted but sync failed: " + err.Error()})
 				return
 			}
-			_ = s.InsertAuditLog(r.Context(), "http", "key_delete", key)
+			_ = s.InsertAuditLog(r.Context(), actor, "key_delete", key)
 			writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 		default:
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
 		}
 	}))
 
-	mux.HandleFunc("/keys/status", withAuth(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/keys/status", requireAdmin(func(w http.ResponseWriter, r *http.Request, principal *store.Principal) {
 		if r.Method != http.MethodPatch {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
 			return
@@ -296,11 +391,11 @@ func buildHTTPServer(cfg cfgpkg.Config, s *store.Store, reconciler *reconcile.Ma
 			writeJSON(w, http.StatusBadGateway, map[string]any{"error": "updated but sync failed: " + err.Error()})
 			return
 		}
-		_ = s.InsertAuditLog(r.Context(), "http", "key_status", fmt.Sprintf("%s=%s", req.Key, status))
+		_ = s.InsertAuditLog(r.Context(), principalActor(principal), "key_status", fmt.Sprintf("%s=%s", req.Key, status))
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 	}))
 
-	mux.HandleFunc("/keys/expiry", withAuth(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/keys/expiry", requireAdmin(func(w http.ResponseWriter, r *http.Request, principal *store.Principal) {
 		if r.Method != http.MethodPatch {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
 			return
@@ -332,11 +427,11 @@ func buildHTTPServer(cfg cfgpkg.Config, s *store.Store, reconciler *reconcile.Ma
 			writeJSON(w, http.StatusBadGateway, map[string]any{"error": "updated but sync failed: " + err.Error()})
 			return
 		}
-		_ = s.InsertAuditLog(r.Context(), "http", "key_expiry", req.Key)
+		_ = s.InsertAuditLog(r.Context(), principalActor(principal), "key_expiry", req.Key)
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 	}))
 
-	mux.HandleFunc("/usage/top", withAuth(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/usage/top", requireAdmin(func(w http.ResponseWriter, r *http.Request, _ *store.Principal) {
 		if r.Method != http.MethodGet {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
 			return
@@ -354,7 +449,7 @@ func buildHTTPServer(cfg cfgpkg.Config, s *store.Store, reconciler *reconcile.Ma
 		writeJSON(w, http.StatusOK, map[string]any{"since": since, "items": items})
 	}))
 
-	mux.HandleFunc("/usage/key", withAuth(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/usage/key", requireAdmin(func(w http.ResponseWriter, r *http.Request, _ *store.Principal) {
 		if r.Method != http.MethodGet {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
 			return
@@ -377,7 +472,7 @@ func buildHTTPServer(cfg cfgpkg.Config, s *store.Store, reconciler *reconcile.Ma
 		writeJSON(w, http.StatusOK, map[string]any{"since": since, "item": item})
 	}))
 
-	mux.HandleFunc("/account/query", withAuth(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/account/query", requireAdmin(func(w http.ResponseWriter, r *http.Request, _ *store.Principal) {
 		if r.Method != http.MethodGet {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
 			return
@@ -400,7 +495,99 @@ func buildHTTPServer(cfg cfgpkg.Config, s *store.Store, reconciler *reconcile.Ma
 		writeJSON(w, http.StatusOK, map[string]any{"since": since, "item": summary})
 	}))
 
-	mux.HandleFunc("/recharge/request", withAuth(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/me", requireUser(func(w http.ResponseWriter, r *http.Request, principal *store.Principal) {
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+			return
+		}
+		email := strings.TrimSpace(principal.Email)
+		if email == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "principal email is not set"})
+			return
+		}
+		since, err := parseSince(r.URL.Query().Get("since"))
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+		summary, err := s.AccountSummarySince(r.Context(), email, since, time.Now().UTC())
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"since": since, "item": summary})
+	}))
+
+	mux.HandleFunc("/identities", requireAdmin(func(w http.ResponseWriter, r *http.Request, principal *store.Principal) {
+		actor := principalActor(principal)
+		switch r.Method {
+		case http.MethodGet:
+			provider := strings.TrimSpace(r.URL.Query().Get("provider"))
+			items, err := s.ListIdentities(r.Context(), provider)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+				return
+			}
+			out := make([]map[string]any, 0, len(items))
+			for _, item := range items {
+				out = append(out, map[string]any{
+					"id":         item.ID,
+					"provider":   item.Provider,
+					"subject":    identitySubjectView(item.Provider, item.Subject),
+					"role":       item.Role,
+					"email":      item.Email,
+					"status":     item.Status,
+					"note":       item.Note,
+					"created_by": item.CreatedBy,
+					"created_at": item.CreatedAt,
+					"updated_at": item.UpdatedAt,
+				})
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"items": out})
+		case http.MethodPost:
+			var req struct {
+				Provider string `json:"provider"`
+				Subject  string `json:"subject"`
+				Role     string `json:"role"`
+				Email    string `json:"email"`
+				Note     string `json:"note"`
+			}
+			if err := decodeJSON(r, &req); err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+				return
+			}
+			if err := s.UpsertIdentity(r.Context(), req.Provider, req.Subject, req.Role, req.Email, req.Note, actor); err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+				return
+			}
+			detail := fmt.Sprintf("provider=%s subject=%s role=%s email=%s", strings.TrimSpace(req.Provider), auditIdentitySubject(req.Provider, req.Subject), strings.TrimSpace(req.Role), strings.ToLower(strings.TrimSpace(req.Email)))
+			_ = s.InsertAuditLog(r.Context(), actor, "identity_upsert", detail)
+			writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+		case http.MethodDelete:
+			provider := strings.TrimSpace(r.URL.Query().Get("provider"))
+			subject := strings.TrimSpace(r.URL.Query().Get("subject"))
+			if provider == "" || subject == "" {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": "missing provider or subject"})
+				return
+			}
+			deleted, err := s.DeleteIdentity(r.Context(), provider, subject)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+				return
+			}
+			if !deleted {
+				writeJSON(w, http.StatusNotFound, map[string]any{"error": "identity not found"})
+				return
+			}
+			detail := fmt.Sprintf("provider=%s subject=%s", provider, auditIdentitySubject(provider, subject))
+			_ = s.InsertAuditLog(r.Context(), actor, "identity_delete", detail)
+			writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+		default:
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+		}
+	}))
+
+	mux.HandleFunc("/recharge/request", requireAdmin(func(w http.ResponseWriter, r *http.Request, principal *store.Principal) {
 		if r.Method != http.MethodPost {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
 			return
@@ -422,7 +609,7 @@ func buildHTTPServer(cfg cfgpkg.Config, s *store.Store, reconciler *reconcile.Ma
 		req.Plan = strings.TrimSpace(req.Plan)
 		req.Note = strings.TrimSpace(req.Note)
 		detail := fmt.Sprintf("email=%s plan=%s note=%s", req.Email, req.Plan, req.Note)
-		_ = s.InsertAuditLog(r.Context(), "http", "recharge_request_placeholder", detail)
+		_ = s.InsertAuditLog(r.Context(), principalActor(principal), "recharge_request_placeholder", detail)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"ok":      true,
 			"status":  "pending",

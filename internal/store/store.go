@@ -8,7 +8,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
+	"os"
+	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -20,6 +24,31 @@ type Store struct {
 }
 
 func Open(databasePath string) (*Store, error) {
+	return open(databasePath)
+}
+
+func OpenWithRecovery(databasePath string, recoverOnCorrupt bool) (*Store, error) {
+	s, err := open(databasePath)
+	if err == nil {
+		return s, nil
+	}
+	if !recoverOnCorrupt || !isLikelyCorruptSQLiteError(err) {
+		return nil, err
+	}
+	backupPath, backupErr := backupCorruptDatabase(databasePath)
+	if backupErr != nil {
+		return nil, fmt.Errorf("backup corrupt database before recovery: %w", backupErr)
+	}
+	_ = os.Remove(databasePath)
+	recovered, reopenErr := open(databasePath)
+	if reopenErr != nil {
+		return nil, fmt.Errorf("rebuild sqlite after corrupt backup(%s): %w", backupPath, reopenErr)
+	}
+	log.Printf("[WARN] sqlite corruption detected, backed up to %s and recreated database", backupPath)
+	return recovered, nil
+}
+
+func open(databasePath string) (*Store, error) {
 	db, err := sql.Open("sqlite", databasePath)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
@@ -28,6 +57,10 @@ func Open(databasePath string) (*Store, error) {
 	db.SetConnMaxIdleTime(2 * time.Minute)
 
 	s := &Store{db: db}
+	if err := s.healthCheck(context.Background()); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	if err := s.migrate(context.Background()); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -94,6 +127,21 @@ func (s *Store) migrate(ctx context.Context) error {
 			detail TEXT NOT NULL,
 			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 		);`,
+		`CREATE TABLE IF NOT EXISTS auth_identities (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			provider TEXT NOT NULL,
+			subject TEXT NOT NULL,
+			role TEXT NOT NULL,
+			email TEXT NOT NULL DEFAULT '',
+			status TEXT NOT NULL DEFAULT 'active',
+			note TEXT NOT NULL DEFAULT '',
+			created_by TEXT NOT NULL DEFAULT '',
+			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			UNIQUE(provider, subject)
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_auth_identities_provider_role_status ON auth_identities(provider, role, status);`,
+		`CREATE INDEX IF NOT EXISTS idx_auth_identities_email ON auth_identities(email);`,
 	}
 	for _, query := range queries {
 		if _, err := s.db.ExecContext(ctx, query); err != nil {
@@ -345,22 +393,46 @@ func (s *Store) SaveUsageSnapshot(ctx context.Context, payload []byte, exportedA
 }
 
 func (s *Store) GetLatestUsageSnapshot(ctx context.Context) (*UsageSnapshot, error) {
-	row := s.db.QueryRowContext(ctx, `
+	items, err := s.ListRecentUsageSnapshots(ctx, 1)
+	if err != nil {
+		return nil, err
+	}
+	if len(items) == 0 {
+		return nil, nil
+	}
+	item := items[0]
+	return &item, nil
+}
+
+func (s *Store) ListRecentUsageSnapshots(ctx context.Context, limit int) ([]UsageSnapshot, error) {
+	if limit <= 0 {
+		limit = 1
+	}
+	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, snapshot_hash, exported_at, payload_json, created_at
 		FROM usage_snapshots
 		ORDER BY exported_at DESC, id DESC
-		LIMIT 1
-	`)
-	var item UsageSnapshot
-	if err := row.Scan(&item.ID, &item.SnapshotHash, &item.ExportedAt, &item.PayloadJSON, &item.CreatedAt); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("query latest usage snapshot: %w", err)
+		LIMIT ?
+	`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("query recent usage snapshots: %w", err)
 	}
-	item.ExportedAt = item.ExportedAt.UTC()
-	item.CreatedAt = item.CreatedAt.UTC()
-	return &item, nil
+	defer rows.Close()
+
+	items := make([]UsageSnapshot, 0, limit)
+	for rows.Next() {
+		var item UsageSnapshot
+		if err := rows.Scan(&item.ID, &item.SnapshotHash, &item.ExportedAt, &item.PayloadJSON, &item.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan usage snapshot: %w", err)
+		}
+		item.ExportedAt = item.ExportedAt.UTC()
+		item.CreatedAt = item.CreatedAt.UTC()
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate usage snapshots: %w", err)
+	}
+	return items, nil
 }
 
 func (s *Store) GetSyncState(ctx context.Context) (SyncState, error) {
@@ -512,6 +584,237 @@ func (s *Store) InsertAuditLog(ctx context.Context, actor, action, detail string
 		return fmt.Errorf("insert audit log: %w", err)
 	}
 	return nil
+}
+
+func (s *Store) UpsertIdentity(ctx context.Context, provider, subject, role, email, note, createdBy string) error {
+	provider, err := normalizeIdentityProvider(provider)
+	if err != nil {
+		return err
+	}
+	subject, err = normalizeIdentitySubject(provider, subject)
+	if err != nil {
+		return err
+	}
+	role, err = normalizeIdentityRole(role)
+	if err != nil {
+		return err
+	}
+	email = normalizeEmail(email)
+	if role == IdentityRoleUser {
+		if !isLikelyEmail(email) {
+			return errors.New("valid email is required for user role")
+		}
+	} else if email != "" && !isLikelyEmail(email) {
+		return errors.New("invalid email")
+	}
+	note = strings.TrimSpace(note)
+	createdBy = strings.TrimSpace(createdBy)
+
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO auth_identities(provider, subject, role, email, status, note, created_by)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(provider, subject) DO UPDATE SET
+			role = excluded.role,
+			email = excluded.email,
+			status = excluded.status,
+			note = excluded.note,
+			updated_at = CURRENT_TIMESTAMP
+	`, provider, subject, role, email, IdentityStatusActive, note, createdBy)
+	if err != nil {
+		return fmt.Errorf("upsert identity: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) DeleteIdentity(ctx context.Context, provider, subject string) (bool, error) {
+	provider, err := normalizeIdentityProvider(provider)
+	if err != nil {
+		return false, err
+	}
+	subject = strings.TrimSpace(subject)
+	if subject == "" {
+		return false, errors.New("subject is required")
+	}
+	var res sql.Result
+	if provider == IdentityProviderHTTP {
+		hashSubject := hashHTTPToken(subject)
+		res, err = s.db.ExecContext(ctx, `
+			DELETE FROM auth_identities
+			WHERE provider = ? AND (subject = ? OR subject = ?)
+		`, provider, hashSubject, strings.ToLower(subject))
+	} else {
+		normalizedSubject, normalizeErr := normalizeIdentitySubject(provider, subject)
+		if normalizeErr != nil {
+			return false, normalizeErr
+		}
+		res, err = s.db.ExecContext(ctx, `DELETE FROM auth_identities WHERE provider = ? AND subject = ?`, provider, normalizedSubject)
+	}
+	if err != nil {
+		return false, fmt.Errorf("delete identity: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
+func (s *Store) ListIdentities(ctx context.Context, providerFilter string) ([]Identity, error) {
+	providerFilter = strings.TrimSpace(providerFilter)
+	if providerFilter != "" {
+		provider, err := normalizeIdentityProvider(providerFilter)
+		if err != nil {
+			return nil, err
+		}
+		providerFilter = provider
+	}
+
+	query := `
+		SELECT id, provider, subject, role, email, status, note, created_by, created_at, updated_at
+		FROM auth_identities
+	`
+	args := make([]any, 0, 1)
+	if providerFilter != "" {
+		query += ` WHERE provider = ?`
+		args = append(args, providerFilter)
+	}
+	query += ` ORDER BY created_at DESC, id DESC`
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list identities: %w", err)
+	}
+	defer rows.Close()
+
+	result := make([]Identity, 0)
+	for rows.Next() {
+		var item Identity
+		if err := rows.Scan(
+			&item.ID,
+			&item.Provider,
+			&item.Subject,
+			&item.Role,
+			&item.Email,
+			&item.Status,
+			&item.Note,
+			&item.CreatedBy,
+			&item.CreatedAt,
+			&item.UpdatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan identity: %w", err)
+		}
+		item.Provider = strings.ToLower(strings.TrimSpace(item.Provider))
+		item.Subject = strings.TrimSpace(item.Subject)
+		item.Role = strings.ToLower(strings.TrimSpace(item.Role))
+		item.Email = normalizeEmail(item.Email)
+		item.Status = strings.ToLower(strings.TrimSpace(item.Status))
+		item.Note = strings.TrimSpace(item.Note)
+		item.CreatedBy = strings.TrimSpace(item.CreatedBy)
+		item.CreatedAt = item.CreatedAt.UTC()
+		item.UpdatedAt = item.UpdatedAt.UTC()
+		result = append(result, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate identities: %w", err)
+	}
+	return result, nil
+}
+
+func (s *Store) ResolveHTTPPrincipal(ctx context.Context, rawToken string) (*Principal, error) {
+	rawToken = strings.TrimSpace(rawToken)
+	if rawToken == "" {
+		return nil, nil
+	}
+	subject := hashHTTPToken(rawToken)
+	return s.resolvePrincipal(ctx, IdentityProviderHTTP, subject)
+}
+
+func (s *Store) ResolveTelegramPrincipal(ctx context.Context, userID int64) (*Principal, error) {
+	if userID <= 0 {
+		return nil, nil
+	}
+	subject := strconv.FormatInt(userID, 10)
+	return s.resolvePrincipal(ctx, IdentityProviderTelegram, subject)
+}
+
+func (s *Store) resolvePrincipal(ctx context.Context, provider, subject string) (*Principal, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT role, email
+		FROM auth_identities
+		WHERE provider = ? AND subject = ? AND status = ?
+		LIMIT 1
+	`, provider, subject, IdentityStatusActive)
+	var role string
+	var email string
+	if err := row.Scan(&role, &email); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("resolve principal: %w", err)
+	}
+
+	role = strings.ToLower(strings.TrimSpace(role))
+	email = normalizeEmail(email)
+	switch role {
+	case IdentityRoleUser:
+		if !isLikelyEmail(email) {
+			return nil, errors.New("identity user role requires valid email")
+		}
+	case IdentityRoleAdmin:
+		if email != "" && !isLikelyEmail(email) {
+			return nil, errors.New("identity admin email is invalid")
+		}
+	default:
+		return nil, fmt.Errorf("invalid identity role %q", role)
+	}
+
+	return &Principal{
+		Provider: provider,
+		Subject:  subject,
+		Role:     role,
+		Email:    email,
+	}, nil
+}
+
+func normalizeIdentityProvider(raw string) (string, error) {
+	provider := strings.ToLower(strings.TrimSpace(raw))
+	switch provider {
+	case IdentityProviderHTTP, IdentityProviderTelegram:
+		return provider, nil
+	default:
+		return "", errors.New("invalid provider")
+	}
+}
+
+func normalizeIdentityRole(raw string) (string, error) {
+	role := strings.ToLower(strings.TrimSpace(raw))
+	switch role {
+	case IdentityRoleAdmin, IdentityRoleUser:
+		return role, nil
+	default:
+		return "", errors.New("invalid role")
+	}
+}
+
+func normalizeIdentitySubject(provider, raw string) (string, error) {
+	subject := strings.TrimSpace(raw)
+	if subject == "" {
+		return "", errors.New("subject is required")
+	}
+	switch provider {
+	case IdentityProviderHTTP:
+		return hashHTTPToken(subject), nil
+	case IdentityProviderTelegram:
+		id, err := strconv.ParseInt(subject, 10, 64)
+		if err != nil || id <= 0 {
+			return "", errors.New("invalid telegram subject")
+		}
+		return strconv.FormatInt(id, 10), nil
+	default:
+		return "", errors.New("invalid provider")
+	}
+}
+
+func hashHTTPToken(raw string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(raw)))
+	return hex.EncodeToString(sum[:])
 }
 
 func (s *Store) UsageTopSince(ctx context.Context, since time.Time, limit int) ([]APIUsageSummary, error) {
@@ -707,6 +1010,77 @@ func (s *Store) AccountSummarySince(ctx context.Context, email string, since tim
 		result.TotalTokens += item.TotalTokens
 	}
 	return result, nil
+}
+
+func healthCheck(ctx context.Context, db *sql.DB) error {
+	if db == nil {
+		return fmt.Errorf("nil database")
+	}
+	if _, err := db.ExecContext(ctx, `PRAGMA quick_check;`); err != nil {
+		if !strings.Contains(strings.ToLower(err.Error()), "no such pragma") {
+			return fmt.Errorf("sqlite quick_check failed: %w", err)
+		}
+	}
+	if _, err := db.ExecContext(ctx, `SELECT 1;`); err != nil {
+		return fmt.Errorf("sqlite ping failed: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) healthCheck(ctx context.Context) error {
+	if s == nil || s.db == nil {
+		return fmt.Errorf("nil store")
+	}
+	if err := healthCheck(ctx, s.db); err != nil {
+		return err
+	}
+	return nil
+}
+
+func isLikelyCorruptSQLiteError(err error) bool {
+	if err == nil {
+		return false
+	}
+	lower := strings.ToLower(err.Error())
+	corruptMarkers := []string{
+		"database disk image is malformed",
+		"file is not a database",
+		"malformed database schema",
+		"database corruption",
+		"sql logic error",
+	}
+	for _, marker := range corruptMarkers {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func backupCorruptDatabase(databasePath string) (string, error) {
+	databasePath = strings.TrimSpace(databasePath)
+	if databasePath == "" {
+		return "", fmt.Errorf("database path is required")
+	}
+	if _, err := os.Stat(databasePath); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", nil
+		}
+		return "", err
+	}
+	dir := filepath.Dir(databasePath)
+	base := filepath.Base(databasePath)
+	backupPath := filepath.Join(dir, fmt.Sprintf("%s.corrupt.%d.bak", base, time.Now().UTC().Unix()))
+	if err := os.Rename(databasePath, backupPath); err != nil {
+		return "", err
+	}
+	for _, suffix := range []string{"-wal", "-shm"} {
+		source := databasePath + suffix
+		if _, err := os.Stat(source); err == nil {
+			_ = os.Rename(source, backupPath+suffix)
+		}
+	}
+	return backupPath, nil
 }
 
 func normalizeJSON(payload []byte) (string, error) {
