@@ -689,6 +689,12 @@ func buildHTTPServer(cfg cfgpkg.Config, s *store.Store, reconciler *reconcile.Ma
 		}
 		return n
 	}
+	resolvePurchaseMonths := func(months *int64) int64 {
+		if months == nil {
+			return 1
+		}
+		return *months
+	}
 	parseQueryBool := func(raw string, fallback bool) bool {
 		raw = strings.ToLower(strings.TrimSpace(raw))
 		if raw == "" {
@@ -797,6 +803,7 @@ func buildHTTPServer(cfg cfgpkg.Config, s *store.Store, reconciler *reconcile.Ma
 			Email  string `json:"email"`
 			PlanID string `json:"plan_id"`
 			Plan   string `json:"plan"`
+			Months *int64 `json:"months"`
 			Note   string `json:"note"`
 		}
 		if err := decodeJSON(r, &req); err != nil {
@@ -807,7 +814,7 @@ func buildHTTPServer(cfg cfgpkg.Config, s *store.Store, reconciler *reconcile.Ma
 		if planID == "" {
 			planID = strings.TrimSpace(req.Plan)
 		}
-		item, err := s.CreatePurchaseRequest(r.Context(), req.Email, planID, req.Note, actor)
+		item, err := s.CreatePurchaseRequest(r.Context(), req.Email, planID, resolvePurchaseMonths(req.Months), req.Note, actor)
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 			return
@@ -1047,6 +1054,7 @@ func buildHTTPServer(cfg cfgpkg.Config, s *store.Store, reconciler *reconcile.Ma
 		var req struct {
 			PlanID string `json:"plan_id"`
 			Plan   string `json:"plan"`
+			Months *int64 `json:"months"`
 			Note   string `json:"note"`
 		}
 		if err := decodeJSON(r, &req); err != nil {
@@ -1057,7 +1065,7 @@ func buildHTTPServer(cfg cfgpkg.Config, s *store.Store, reconciler *reconcile.Ma
 		if planID == "" {
 			planID = strings.TrimSpace(req.Plan)
 		}
-		item, err := s.CreatePurchaseRequest(r.Context(), email, planID, req.Note, actor)
+		item, err := s.CreatePurchaseRequest(r.Context(), email, planID, resolvePurchaseMonths(req.Months), req.Note, actor)
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 			return

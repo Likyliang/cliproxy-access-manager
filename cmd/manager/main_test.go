@@ -190,7 +190,7 @@ func TestWebUIRoutesAndV1RBAC(t *testing.T) {
 		t.Fatalf("/api/v1/plans missing default plan body=%s", plansRR.Body.String())
 	}
 
-	purchaseReq := httptest.NewRequest(http.MethodPost, "/api/v1/purchase-requests", strings.NewReader(`{"plan_id":"`+store.PlanIDWebChatMonthly+`","note":"hi"}`))
+	purchaseReq := httptest.NewRequest(http.MethodPost, "/api/v1/purchase-requests", strings.NewReader(`{"plan_id":"`+store.PlanIDWebChatMonthly+`","months":2,"note":"hi"}`))
 	purchaseReq.Header.Set("Authorization", "Bearer user-http-token")
 	purchaseReq.Header.Set("Content-Type", "application/json")
 	purchaseRR := httptest.NewRecorder()
@@ -240,7 +240,7 @@ func TestAdminPurchaseApprovalActivatesProvisionedKey(t *testing.T) {
 	reconciler := reconcile.NewManager(s, nil, 0, 0, 0, true, "04:00", "/v0/management/latest-version", "", false, false, 10)
 	srv := buildHTTPServer(cfg, s, reconciler)
 
-	createReq := httptest.NewRequest(http.MethodPost, "/api/v1/purchase-requests", strings.NewReader(`{"plan_id":"`+store.PlanIDWebChatMonthly+`","note":"approve me"}`))
+	createReq := httptest.NewRequest(http.MethodPost, "/api/v1/purchase-requests", strings.NewReader(`{"plan_id":"`+store.PlanIDWebChatMonthly+`","months":3,"note":"approve me"}`))
 	createReq.Header.Set("Authorization", "Bearer user-http-token")
 	createReq.Header.Set("Content-Type", "application/json")
 	createRR := httptest.NewRecorder()
@@ -267,6 +267,9 @@ func TestAdminPurchaseApprovalActivatesProvisionedKey(t *testing.T) {
 	if len(pending) != 1 {
 		t.Fatalf("expected one pending request, got=%d", len(pending))
 	}
+	if pending[0].Months != 3 {
+		t.Fatalf("pending months=%d want=3", pending[0].Months)
+	}
 
 	patchBody := `{"id":` + strconv.FormatInt(pending[0].ID, 10) + `,"status":"approved","review_note":"ok"}`
 	approveReq := httptest.NewRequest(http.MethodPatch, "/api/v1/admin/purchase-requests", strings.NewReader(patchBody))
@@ -287,6 +290,72 @@ func TestAdminPurchaseApprovalActivatesProvisionedKey(t *testing.T) {
 	}
 	if keysAfter[0].Status != store.KeyStatusActive {
 		t.Fatalf("expected key active after approval, got=%s", keysAfter[0].Status)
+	}
+	if keysAfter[0].ExpiresAt == nil {
+		t.Fatalf("expected key expires_at after approval")
+	}
+	approvedItem, err := s.GetPurchaseRequestByID(t.Context(), pending[0].ID)
+	if err != nil {
+		t.Fatalf("load approved purchase request: %v", err)
+	}
+	if approvedItem == nil || approvedItem.ReviewedAt == nil {
+		t.Fatalf("expected reviewed_at after approval, got=%#v", approvedItem)
+	}
+	expectedExpires := approvedItem.ReviewedAt.AddDate(0, int(approvedItem.Months), 0)
+	delta := keysAfter[0].ExpiresAt.Sub(expectedExpires)
+	if delta < -2*time.Second || delta > 2*time.Second {
+		t.Fatalf("unexpected key expires_at=%s expected=%s delta=%s", keysAfter[0].ExpiresAt.UTC().Format(time.RFC3339Nano), expectedExpires.UTC().Format(time.RFC3339Nano), delta)
+	}
+}
+
+func TestPurchaseRequestMonthsValidationAndDefault(t *testing.T) {
+	t.Parallel()
+
+	dbPath := t.TempDir() + "/apim.db"
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer s.Close()
+
+	if err := s.UpsertIdentity(t.Context(), store.IdentityProviderHTTP, "admin-http-token", store.IdentityRoleAdmin, "admin@example.com", "", "test"); err != nil {
+		t.Fatalf("upsert admin identity: %v", err)
+	}
+	if err := s.UpsertIdentity(t.Context(), store.IdentityProviderHTTP, "user-http-token", store.IdentityRoleUser, "user@example.com", "", "test"); err != nil {
+		t.Fatalf("upsert user identity: %v", err)
+	}
+
+	cfg := cfgpkg.Config{HTTPAuthToken: "bootstrap", HTTPAddr: "127.0.0.1:0", AuthSessionTTL: 24 * time.Hour, AuthCookieName: "apim_session"}
+	reconciler := reconcile.NewManager(s, nil, 0, 0, 0, true, "04:00", "/v0/management/latest-version", "", false, false, 10)
+	srv := buildHTTPServer(cfg, s, reconciler)
+
+	invalidReq := httptest.NewRequest(http.MethodPost, "/api/v1/purchase-requests", strings.NewReader(`{"plan_id":"`+store.PlanIDWebChatMonthly+`","months":0,"note":"bad"}`))
+	invalidReq.Header.Set("Authorization", "Bearer user-http-token")
+	invalidReq.Header.Set("Content-Type", "application/json")
+	invalidRR := httptest.NewRecorder()
+	srv.Handler.ServeHTTP(invalidRR, invalidReq)
+	if invalidRR.Code != http.StatusBadRequest {
+		t.Fatalf("invalid months code=%d want=%d body=%s", invalidRR.Code, http.StatusBadRequest, invalidRR.Body.String())
+	}
+
+	createReq := httptest.NewRequest(http.MethodPost, "/api/v1/purchase-requests", strings.NewReader(`{"plan_id":"`+store.PlanIDWebChatMonthly+`","note":"default months"}`))
+	createReq.Header.Set("Authorization", "Bearer user-http-token")
+	createReq.Header.Set("Content-Type", "application/json")
+	createRR := httptest.NewRecorder()
+	srv.Handler.ServeHTTP(createRR, createReq)
+	if createRR.Code != http.StatusOK {
+		t.Fatalf("create without months code=%d want=%d body=%s", createRR.Code, http.StatusOK, createRR.Body.String())
+	}
+
+	pending, err := s.ListPurchaseRequests(t.Context(), "user@example.com", store.PurchaseRequestStatusPending, 10)
+	if err != nil {
+		t.Fatalf("list pending purchases: %v", err)
+	}
+	if len(pending) == 0 {
+		t.Fatalf("expected pending purchase request")
+	}
+	if pending[0].Months != 1 {
+		t.Fatalf("default months=%d want=1", pending[0].Months)
 	}
 }
 

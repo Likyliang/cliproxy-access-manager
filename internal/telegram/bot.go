@@ -518,7 +518,7 @@ func (b *Bot) executeCommand(ctx context.Context, text string, chatID, userID in
 		if len(args) > 2 {
 			note = strings.Join(args[2:], " ")
 		}
-		item, err := b.store.CreatePurchaseRequest(ctx, email, planID, note, actor)
+		item, err := b.store.CreatePurchaseRequest(ctx, email, planID, 1, note, actor)
 		if err != nil {
 			return "Failed: " + err.Error()
 		}
