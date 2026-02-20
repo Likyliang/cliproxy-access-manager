@@ -5,6 +5,7 @@ import type { PlanCatalogItem } from '../../types'
 export function UserPurchaseNewPage() {
   const [plans, setPlans] = useState<PlanCatalogItem[]>([])
   const [planId, setPlanId] = useState('')
+  const [months, setMonths] = useState(1)
   const [note, setNote] = useState('')
   const [msg, setMsg] = useState('')
 
@@ -30,13 +31,28 @@ export function UserPurchaseNewPage() {
           </select>
         </label>
         <label>
+          订阅月数
+          <input
+            type="number"
+            min={1}
+            max={36}
+            step={1}
+            value={months}
+            onChange={(e) => setMonths(Number(e.target.value || 1))}
+          />
+        </label>
+        <label>
           备注
           <textarea value={note} onChange={(e) => setNote(e.target.value)} rows={4} />
         </label>
         <button
           onClick={async () => {
             try {
-              const r = await createPurchaseRequest(planId, note)
+              if (!Number.isFinite(months) || months < 1 || months > 36) {
+                setMsg('提交失败: 订阅月数必须在 1-36 之间')
+                return
+              }
+              const r = await createPurchaseRequest(planId, months, note)
               setMsg(`提交成功，申请 ID=${r.item.id}`)
             } catch (e: any) {
               setMsg(`提交失败: ${e.message}`)

@@ -37,7 +37,7 @@ export function AdminPurchasesPage() {
       <p className="msg">{msg}</p>
       <table>
         <thead>
-          <tr><th>ID</th><th>Email</th><th>Status</th><th>Plan ID</th><th>Provisioning</th><th>Actions</th></tr>
+          <tr><th>ID</th><th>Email</th><th>Status</th><th>Plan ID</th><th>订阅月数</th><th>Provisioning</th><th>Actions</th></tr>
         </thead>
         <tbody>
           {items.map((i) => (
@@ -46,6 +46,7 @@ export function AdminPurchasesPage() {
               <td>{i.requester_email}</td>
               <td>{i.status}</td>
               <td>{i.plan_id || i.plan}</td>
+              <td>{i.months}</td>
               <td>{i.provisioning_status || '-'}</td>
               <td>
                 <button onClick={() => mutate(i.id, 'approved')}>Approve</button>

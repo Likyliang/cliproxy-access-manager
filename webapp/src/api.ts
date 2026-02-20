@@ -4,8 +4,10 @@ import type {
   PlanCatalogItem,
   Principal,
   PurchaseRequest,
+  ReconcilerStatus,
   UsageControl,
   UsageOverview,
+  UserUsageResponse,
 } from './types'
 
 const TOKEN_KEY = 'apim.web.token'
@@ -106,10 +108,10 @@ export async function listPlans() {
   return api<{ items: PlanCatalogItem[] }>('/api/v1/plans')
 }
 
-export async function createPurchaseRequest(planId: string, note: string) {
+export async function createPurchaseRequest(planId: string, months: number, note: string) {
   return api<{ item: PurchaseRequest }>('/api/v1/purchase-requests', {
     method: 'POST',
-    body: JSON.stringify({ plan_id: planId, note }),
+    body: JSON.stringify({ plan_id: planId, months, note }),
   })
 }
 
@@ -118,15 +120,94 @@ export async function listMyPurchases() {
 }
 
 export async function listMyKeys(since = '24h') {
-  return api<{ items: APIKeyItem[] }>(`/api/v1/user/keys?since=${encodeURIComponent(since)}`)
+  const data = await api<{ items: APIKeyItem[] }>(`/api/v1/user/keys?since=${encodeURIComponent(since)}`)
+  const items = (data.items || []).map((item) => ({
+    ...item,
+    total_requests: toNum(item.total_requests),
+    failed_requests: toNum(item.failed_requests),
+    total_tokens: toNum(item.total_tokens),
+    control: item.control
+      ? {
+          ...item.control,
+          max_requests: item.control.max_requests == null ? undefined : toNum(item.control.max_requests),
+          max_tokens: item.control.max_tokens == null ? undefined : toNum(item.control.max_tokens),
+          remaining_requests: item.control.remaining_requests == null ? undefined : toNum(item.control.remaining_requests),
+          remaining_tokens: item.control.remaining_tokens == null ? undefined : toNum(item.control.remaining_tokens),
+        }
+      : undefined,
+  }))
+  return { items }
 }
 
-export async function getMyUsage(since = '24h') {
-  return api<any>(`/api/v1/user/usage?since=${encodeURIComponent(since)}`)
+function toNum(v: any): number {
+  const n = Number(v)
+  return Number.isFinite(n) ? n : 0
+}
+
+function normalizeAccountSummary(input: any) {
+  if (!input || typeof input !== 'object') {
+    return {
+      email: '',
+      keys: [] as string[],
+      total_requests: 0,
+      failed_requests: 0,
+      total_tokens: 0,
+      valid_days: 0,
+      unlimited: false,
+      valid_until: undefined as string | undefined,
+    }
+  }
+
+  const keysRaw = input.keys ?? input.Keys
+  const keys = Array.isArray(keysRaw)
+    ? keysRaw.map((k) => String(k || '').trim()).filter(Boolean)
+    : []
+
+  return {
+    email: String(input.email ?? input.Email ?? '').trim(),
+    keys,
+    total_requests: toNum(input.total_requests ?? input.TotalRequests),
+    failed_requests: toNum(input.failed_requests ?? input.FailedRequests),
+    total_tokens: toNum(input.total_tokens ?? input.TotalTokens),
+    valid_days: toNum(input.valid_days ?? input.ValidDays),
+    unlimited: Boolean(input.unlimited ?? input.Unlimited),
+    valid_until: String(input.valid_until ?? input.ValidUntil ?? '').trim() || undefined,
+  }
+}
+
+export async function getMyUsage(since = '24h'): Promise<UserUsageResponse> {
+  const data = await api<any>(`/api/v1/user/usage?since=${encodeURIComponent(since)}`)
+  return {
+    since: String(data?.since || ''),
+    summary: normalizeAccountSummary(data?.summary),
+    usage: {
+      total_requests: Number(data?.usage?.total_requests || 0),
+      failed_requests: Number(data?.usage?.failed_requests || 0),
+      total_tokens: Number(data?.usage?.total_tokens || 0),
+      control: data?.usage?.control || undefined,
+    },
+    keys: Array.isArray(data?.keys) ? data.keys : [],
+  }
 }
 
 export async function getUsageOverview(since = '24h') {
   return api<UsageOverview>(`/api/v1/admin/usage/overview?since=${encodeURIComponent(since)}`)
+}
+
+export async function getReconcilerStatus() {
+  return api<ReconcilerStatus>('/status')
+}
+
+export async function checkMainProjectUpdate() {
+  return api<{ ok: boolean; status?: ReconcilerStatus }>('/update/check', {
+    method: 'POST',
+  })
+}
+
+export async function applyMainProjectUpdate() {
+  return api<{ ok: boolean; status?: ReconcilerStatus }>('/update/apply', {
+    method: 'POST',
+  })
 }
 
 export async function listAdminPurchases(status = '') {

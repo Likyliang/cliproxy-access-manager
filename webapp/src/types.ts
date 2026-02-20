@@ -27,6 +27,7 @@ export type PurchaseRequest = {
   requester_email: string
   plan: string
   plan_id: string
+  months: number
   note: string
   status: string
   review_note: string
@@ -50,6 +51,9 @@ export type APIKeyItem = {
     remaining_tokens?: number
   }
   plan_id?: string
+  owner_email?: string
+  note?: string
+  updated_at?: string
 }
 
 export type UsageOverview = {
@@ -60,6 +64,65 @@ export type UsageOverview = {
   }
   top_users?: Array<{ email: string; total_requests: number; failed_requests: number; total_tokens: number; keys: string[] }>
   top_keys?: Array<{ api_key: string; total_requests: number; failed_requests: number; total_tokens: number }>
+}
+
+export type AccountSummary = {
+  email: string
+  keys: string[]
+  total_requests: number
+  failed_requests: number
+  total_tokens: number
+  valid_days: number
+  unlimited: boolean
+  valid_until?: string
+}
+
+export type UsageControlView = {
+  scope_type?: string
+  scope_value?: string
+  window_seconds?: number
+  action?: string
+  max_requests?: number
+  max_tokens?: number
+  remaining_requests?: number
+  remaining_tokens?: number
+}
+
+export type UserUsageResponse = {
+  since: string
+  summary: AccountSummary
+  usage: {
+    total_requests: number
+    failed_requests: number
+    total_tokens: number
+    control?: UsageControlView
+  }
+  keys: Array<{
+    key: string
+    total_requests: number
+    failed_requests: number
+    total_tokens: number
+    control?: UsageControlView
+  }>
+}
+
+export type ReconcilerStatus = {
+  healthy: boolean
+  last_key_sync_at?: string
+  last_usage_snapshot_at?: string
+  last_recovery_import_at?: string
+  last_update_check_at?: string
+  last_keys_hash?: string
+  last_snapshot_hash?: string
+  last_recovery_hash?: string
+  current_version?: string
+  latest_version?: string
+  update_status?: string
+  update_message?: string
+  update_check_time?: string
+  update_apply_mode?: string
+  update_command_set?: boolean
+  message?: string
 }
 
 export type AuthUser = {

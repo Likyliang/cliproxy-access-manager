@@ -26,6 +26,7 @@ export function UserPurchaseHistoryPage() {
             <th>ID</th>
             <th>状态</th>
             <th>Plan ID</th>
+            <th>订阅月数</th>
             <th>备注</th>
             <th>评审备注</th>
             <th>创建时间</th>
@@ -38,6 +39,7 @@ export function UserPurchaseHistoryPage() {
               <td>{i.id}</td>
               <td>{i.status}</td>
               <td>{i.plan_id || i.plan}</td>
+              <td>{i.months}</td>
               <td>{i.note}</td>
               <td>{i.review_note}</td>
               <td>{i.created_at}</td>
