@@ -219,7 +219,7 @@ func TestPurchaseRequestLifecycle(t *testing.T) {
 	}
 	defer s.Close()
 
-	item, err := s.CreatePurchaseRequest(t.Context(), "buyer@example.com", PlanIDWebChatMonthly, "need for project", "tester")
+	item, err := s.CreatePurchaseRequest(t.Context(), "buyer@example.com", PlanIDWebChatMonthly, 3, "need for project", "tester")
 	if err != nil {
 		t.Fatalf("create purchase request: %v", err)
 	}
@@ -228,6 +228,9 @@ func TestPurchaseRequestLifecycle(t *testing.T) {
 	}
 	if item.PlanID != PlanIDWebChatMonthly || item.Plan != PlanIDWebChatMonthly {
 		t.Fatalf("expected plan id in request, got plan=%s plan_id=%s", item.Plan, item.PlanID)
+	}
+	if item.Months != 3 {
+		t.Fatalf("months=%d want=3", item.Months)
 	}
 	if item.ProvisioningStatus != PurchaseRequestProvisioningReady {
 		t.Fatalf("provisioning status=%s want=%s", item.ProvisioningStatus, PurchaseRequestProvisioningReady)
@@ -302,6 +305,17 @@ func TestPurchaseRequestLifecycle(t *testing.T) {
 	if len(keys) != 1 || keys[0].Status != KeyStatusActive {
 		t.Fatalf("expected approved key active, got %#v", keys)
 	}
+	if keys[0].ExpiresAt == nil {
+		t.Fatalf("expected approved key expires_at to be set")
+	}
+	if approved.ReviewedAt == nil {
+		t.Fatalf("expected reviewed_at after approve")
+	}
+	expectedExpires := approved.ReviewedAt.AddDate(0, int(item.Months), 0)
+	delta := keys[0].ExpiresAt.Sub(expectedExpires)
+	if delta < -2*time.Second || delta > 2*time.Second {
+		t.Fatalf("unexpected expires_at=%s expected=%s delta=%s", keys[0].ExpiresAt.UTC().Format(time.RFC3339Nano), expectedExpires.UTC().Format(time.RFC3339Nano), delta)
+	}
 
 	fulfilled, err := s.UpdatePurchaseRequestStatus(t.Context(), item.ID, PurchaseRequestStatusFulfilled, "delivered", "admin")
 	if err != nil {
@@ -314,6 +328,32 @@ func TestPurchaseRequestLifecycle(t *testing.T) {
 	_, err = s.UpdatePurchaseRequestStatus(t.Context(), item.ID, PurchaseRequestStatusPending, "rollback", "admin")
 	if err == nil {
 		t.Fatalf("expected invalid transition error")
+	}
+}
+
+func TestPurchaseRequestMonthsValidation(t *testing.T) {
+	t.Parallel()
+
+	dbPath := t.TempDir() + "/apim.db"
+	s, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer s.Close()
+
+	_, err = s.CreatePurchaseRequest(t.Context(), "buyer@example.com", PlanIDWebChatMonthly, 0, "invalid months", "tester")
+	if err == nil {
+		t.Fatalf("expected error for months=0")
+	}
+
+	_, err = s.CreatePurchaseRequest(t.Context(), "buyer@example.com", PlanIDWebChatMonthly, -1, "invalid months", "tester")
+	if err == nil {
+		t.Fatalf("expected error for months<0")
+	}
+
+	_, err = s.CreatePurchaseRequest(t.Context(), "buyer@example.com", PlanIDWebChatMonthly, 37, "invalid months", "tester")
+	if err == nil {
+		t.Fatalf("expected error for months above max")
 	}
 }
 

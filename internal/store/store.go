@@ -33,6 +33,8 @@ const (
 	passwordHashSaltBytes  = 16
 	passwordHashKeyBytes   = 32
 	sessionTokenBytes      = 32
+	minPurchaseMonths      = int64(1)
+	maxPurchaseMonths      = int64(36)
 )
 
 func Open(databasePath string) (*Store, error) {
@@ -197,6 +199,7 @@ func (s *Store) migrate(ctx context.Context) error {
 			provisioned_api_key TEXT NOT NULL DEFAULT '',
 			provisioning_status TEXT NOT NULL DEFAULT 'pending',
 			activation_attempted_at DATETIME NULL,
+			months INTEGER NOT NULL DEFAULT 1,
 			note TEXT NOT NULL DEFAULT '',
 			status TEXT NOT NULL DEFAULT 'pending',
 			review_note TEXT NOT NULL DEFAULT '',
@@ -211,6 +214,7 @@ func (s *Store) migrate(ctx context.Context) error {
 		`ALTER TABLE purchase_requests ADD COLUMN provisioned_api_key TEXT NOT NULL DEFAULT '';`,
 		`ALTER TABLE purchase_requests ADD COLUMN provisioning_status TEXT NOT NULL DEFAULT 'pending';`,
 		`ALTER TABLE purchase_requests ADD COLUMN activation_attempted_at DATETIME NULL;`,
+		`ALTER TABLE purchase_requests ADD COLUMN months INTEGER NOT NULL DEFAULT 1;`,
 		`CREATE INDEX IF NOT EXISTS idx_purchase_requests_status_created_at ON purchase_requests(status, created_at);`,
 		`CREATE INDEX IF NOT EXISTS idx_purchase_requests_requester_email_created_at ON purchase_requests(requester_email, created_at);`,
 		`CREATE TABLE IF NOT EXISTS plan_catalog (
@@ -1423,6 +1427,7 @@ func scanPurchaseRequest(row rowScanner) (*PurchaseRequest, error) {
 		&item.ProvisionedAPIKey,
 		&item.ProvisioningStatus,
 		&activationAttemptedAt,
+		&item.Months,
 		&item.Note,
 		&item.Status,
 		&item.ReviewNote,
@@ -1445,6 +1450,11 @@ func scanPurchaseRequest(row rowScanner) (*PurchaseRequest, error) {
 	}
 	item.PlanSnapshotJSON = strings.TrimSpace(item.PlanSnapshotJSON)
 	item.ProvisionedAPIKey = strings.TrimSpace(item.ProvisionedAPIKey)
+	months, err := normalizePurchaseMonths(item.Months)
+	if err != nil {
+		return nil, err
+	}
+	item.Months = months
 	item.ProvisioningStatus = strings.ToLower(strings.TrimSpace(item.ProvisioningStatus))
 	if item.ProvisioningStatus == "" {
 		item.ProvisioningStatus = PurchaseRequestProvisioningPending
@@ -1772,7 +1782,7 @@ func (s *Store) GetPlanCatalogByID(ctx context.Context, id string) (*PlanCatalog
 	return scanPlanCatalogItem(row)
 }
 
-func (s *Store) CreatePurchaseRequest(ctx context.Context, requesterEmail, planID, note, createdBy string) (*PurchaseRequest, error) {
+func (s *Store) CreatePurchaseRequest(ctx context.Context, requesterEmail, planID string, months int64, note, createdBy string) (*PurchaseRequest, error) {
 	requesterEmail = normalizeEmail(requesterEmail)
 	if !isLikelyEmail(requesterEmail) {
 		return nil, errors.New("valid requester email is required")
@@ -1780,16 +1790,20 @@ func (s *Store) CreatePurchaseRequest(ctx context.Context, requesterEmail, planI
 	planID = strings.TrimSpace(planID)
 	if planID == "" {
 		return nil, errors.New("plan_id is required")
+	}
+	normalizedMonths, err := normalizePurchaseMonths(months)
+	if err != nil {
+		return nil, err
 	}
 	note = strings.TrimSpace(note)
 	createdBy = strings.TrimSpace(createdBy)
 	if createdBy == "" {
 		createdBy = "system"
 	}
-	return s.createPurchaseRequestWithProvisioning(ctx, requesterEmail, planID, note, createdBy)
+	return s.createPurchaseRequestWithProvisioning(ctx, requesterEmail, planID, normalizedMonths, note, createdBy)
 }
 
-func (s *Store) createPurchaseRequestWithProvisioning(ctx context.Context, requesterEmail, planID, note, createdBy string) (*PurchaseRequest, error) {
+func (s *Store) createPurchaseRequestWithProvisioning(ctx context.Context, requesterEmail, planID string, months int64, note, createdBy string) (*PurchaseRequest, error) {
 	requesterEmail = normalizeEmail(requesterEmail)
 	if !isLikelyEmail(requesterEmail) {
 		return nil, errors.New("valid requester email is required")
@@ -1798,6 +1812,11 @@ func (s *Store) createPurchaseRequestWithProvisioning(ctx context.Context, reque
 	if planID == "" {
 		return nil, errors.New("plan_id is required")
 	}
+	normalizedMonths, err := normalizePurchaseMonths(months)
+	if err != nil {
+		return nil, err
+	}
+	months = normalizedMonths
 	note = strings.TrimSpace(note)
 	createdBy = strings.TrimSpace(createdBy)
 	if createdBy == "" {
@@ -1850,12 +1869,13 @@ func (s *Store) createPurchaseRequestWithProvisioning(ctx context.Context, reque
 			plan_snapshot_json,
 			provisioned_api_key,
 			provisioning_status,
+			months,
 			note,
 			status,
 			created_by
 		)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, requesterEmail, plan.ID, plan.ID, planSnapshotJSON, generatedKey, PurchaseRequestProvisioningReady, note, PurchaseRequestStatusPending, createdBy)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, requesterEmail, plan.ID, plan.ID, planSnapshotJSON, generatedKey, PurchaseRequestProvisioningReady, months, note, PurchaseRequestStatusPending, createdBy)
 	if err != nil {
 		return nil, fmt.Errorf("create purchase request: %w", err)
 	}
@@ -1925,7 +1945,7 @@ func (s *Store) GetPurchaseRequestByID(ctx context.Context, id int64) (*Purchase
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, requester_email, plan, plan_id, plan_snapshot_json,
 		       provisioned_api_key, provisioning_status, activation_attempted_at,
-		       note, status, review_note, created_by, reviewed_by,
+		       months, note, status, review_note, created_by, reviewed_by,
 		       created_at, updated_at, reviewed_at
 		FROM purchase_requests
 		WHERE id = ?
@@ -1958,7 +1978,7 @@ func (s *Store) ListPurchaseRequests(ctx context.Context, requesterEmail, status
 	query := `
 		SELECT id, requester_email, plan, plan_id, plan_snapshot_json,
 		       provisioned_api_key, provisioning_status, activation_attempted_at,
-		       note, status, review_note, created_by, reviewed_by,
+		       months, note, status, review_note, created_by, reviewed_by,
 		       created_at, updated_at, reviewed_at
 		FROM purchase_requests
 	`
@@ -2029,7 +2049,7 @@ func (s *Store) UpdatePurchaseRequestStatus(ctx context.Context, id int64, statu
 	row := tx.QueryRowContext(ctx, `
 		SELECT id, requester_email, plan, plan_id, plan_snapshot_json,
 		       provisioned_api_key, provisioning_status, activation_attempted_at,
-		       note, status, review_note, created_by, reviewed_by,
+		       months, note, status, review_note, created_by, reviewed_by,
 		       created_at, updated_at, reviewed_at
 		FROM purchase_requests
 		WHERE id = ?
@@ -2050,9 +2070,11 @@ func (s *Store) UpdatePurchaseRequestStatus(ctx context.Context, id int64, statu
 	}
 
 	reviewedAt := sql.NullTime{}
+	reviewedAtValue := time.Time{}
 	if status != PurchaseRequestStatusPending {
 		now := time.Now().UTC()
 		reviewedAt = sql.NullTime{Time: now, Valid: true}
+		reviewedAtValue = now
 	}
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE purchase_requests
@@ -2080,11 +2102,12 @@ func (s *Store) UpdatePurchaseRequestStatus(ctx context.Context, id int64, statu
 			}
 			return nil, errors.New("purchase request has no provisioned api key")
 		}
+		expiresAt := reviewedAtValue.AddDate(0, int(current.Months), 0)
 		res, err := tx.ExecContext(ctx, `
 			UPDATE api_keys
-			SET status = ?, updated_at = CURRENT_TIMESTAMP
+			SET status = ?, expires_at = ?, updated_at = CURRENT_TIMESTAMP
 			WHERE api_key = ?
-		`, KeyStatusActive, key)
+		`, KeyStatusActive, expiresAt, key)
 		if err != nil {
 			return nil, fmt.Errorf("activate provisioned api key: %w", err)
 		}
@@ -2849,6 +2872,13 @@ func normalizePurchaseRequestProvisioningStatus(raw string) (string, error) {
 	default:
 		return "", errors.New("invalid purchase request provisioning status")
 	}
+}
+
+func normalizePurchaseMonths(months int64) (int64, error) {
+	if months < minPurchaseMonths || months > maxPurchaseMonths {
+		return 0, fmt.Errorf("months must be between %d and %d", minPurchaseMonths, maxPurchaseMonths)
+	}
+	return months, nil
 }
 
 func normalizePlanPersona(raw string) (string, error) {

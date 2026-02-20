@@ -187,6 +187,7 @@ type PurchaseRequest struct {
 	ProvisionedAPIKey     string     `json:"-"`
 	ProvisioningStatus    string     `json:"provisioning_status"`
 	ActivationAttemptedAt *time.Time `json:"activation_attempted_at,omitempty"`
+	Months                int64      `json:"months"`
 	Note                  string     `json:"note"`
 	Status                string     `json:"status"`
 	ReviewNote            string     `json:"review_note"`

@@ -48,3 +48,26 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     detail TEXT NOT NULL,
     created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS purchase_requests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    requester_email TEXT NOT NULL,
+    plan TEXT NOT NULL DEFAULT '',
+    plan_id TEXT NOT NULL DEFAULT '',
+    plan_snapshot_json TEXT NOT NULL DEFAULT '',
+    provisioned_api_key TEXT NOT NULL DEFAULT '',
+    provisioning_status TEXT NOT NULL DEFAULT 'pending',
+    activation_attempted_at DATETIME NULL,
+    months INTEGER NOT NULL DEFAULT 1,
+    note TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'pending',
+    review_note TEXT NOT NULL DEFAULT '',
+    created_by TEXT NOT NULL DEFAULT '',
+    reviewed_by TEXT NOT NULL DEFAULT '',
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    reviewed_at DATETIME NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_purchase_requests_status_created_at ON purchase_requests(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_purchase_requests_requester_email_created_at ON purchase_requests(requester_email, created_at);
