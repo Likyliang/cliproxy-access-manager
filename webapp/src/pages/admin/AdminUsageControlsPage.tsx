@@ -39,6 +39,17 @@ export function AdminUsageControlsPage() {
       <p className="msg">{msg}</p>
 
       <div className="panel">
+        <h3>动作说明</h3>
+        <ul>
+          <li><code>audit_only</code>: 仅记录，不改 key 状态。</li>
+          <li><code>disable_key</code>: 禁用单个 key（scope 必须是 <code>key</code>）。</li>
+          <li><code>disable_user_keys</code>: 禁用该用户全部 key（scope 必须是 <code>user</code>）。</li>
+          <li><code>disable_all_keys</code>: 禁用全局全部 key（通常配合 <code>global</code>）。</li>
+        </ul>
+        <p>如需直接启用/禁用、改过期、删除 key，请到「Keys 管理」页面。</p>
+      </div>
+
+      <div className="panel">
         <h3>创建规则</h3>
         <div className="row">
           <select value={scopeType} onChange={(e) => setScopeType(e.target.value)}>
@@ -83,7 +94,7 @@ export function AdminUsageControlsPage() {
 
       <table>
         <thead>
-          <tr><th>ID</th><th>Scope</th><th>Window</th><th>Req</th><th>Tok</th><th>Action</th><th>Enabled</th><th>Note</th></tr>
+          <tr><th>ID</th><th>Scope</th><th>Window</th><th>Window Mode</th><th>Anchor</th><th>Req</th><th>Tok</th><th>Action</th><th>Enabled</th><th>Note</th></tr>
         </thead>
         <tbody>
           {items.map((c) => (
@@ -91,6 +102,8 @@ export function AdminUsageControlsPage() {
               <td>{c.id}</td>
               <td>{c.scope_type}:{c.scope_value || ''}</td>
               <td>{c.window_seconds}</td>
+              <td>{c.window_mode || 'rolling'}</td>
+              <td>{c.cycle_anchor_at || '-'}</td>
               <td>{c.max_requests ?? '∞'}</td>
               <td>{c.max_tokens ?? '∞'}</td>
               <td>{c.action}</td>

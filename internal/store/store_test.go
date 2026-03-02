@@ -270,6 +270,12 @@ func TestPurchaseRequestLifecycle(t *testing.T) {
 			if control.MaxTokens == nil || *control.MaxTokens <= 0 {
 				t.Fatalf("expected key max_tokens from plan, got=%v", control.MaxTokens)
 			}
+			if control.WindowMode != UsageControlWindowModeFixedCycle {
+				t.Fatalf("usage control window_mode=%s want=%s", control.WindowMode, UsageControlWindowModeFixedCycle)
+			}
+			if control.CycleAnchorAt != nil {
+				t.Fatalf("cycle_anchor_at should be nil before approval")
+			}
 		}
 	}
 	if !matched {
@@ -296,6 +302,29 @@ func TestPurchaseRequestLifecycle(t *testing.T) {
 	}
 	if approved.ActivationAttemptedAt == nil {
 		t.Fatalf("expected activation_attempted_at after approve")
+	}
+
+	controls, err = s.ListUsageControls(t.Context(), true)
+	if err != nil {
+		t.Fatalf("list usage controls after approval: %v", err)
+	}
+	anchorMatched := false
+	for _, control := range controls {
+		if control.ScopeType == UsageControlScopeKey && control.ScopeValue == keys[0].Key {
+			anchorMatched = true
+			if control.CycleAnchorAt == nil {
+				t.Fatalf("expected cycle_anchor_at after approve")
+			}
+			if control.CycleAnchorAt != nil {
+				deltaAnchor := control.CycleAnchorAt.Sub(*approved.ReviewedAt)
+				if deltaAnchor < -2*time.Second || deltaAnchor > 2*time.Second {
+					t.Fatalf("unexpected cycle_anchor_at=%s reviewed_at=%s delta=%s", control.CycleAnchorAt.UTC().Format(time.RFC3339Nano), approved.ReviewedAt.UTC().Format(time.RFC3339Nano), deltaAnchor)
+				}
+			}
+		}
+	}
+	if !anchorMatched {
+		t.Fatalf("expected matched usage control after approval")
 	}
 
 	keys, err = s.ListAPIKeysByOwner(t.Context(), "buyer@example.com")
@@ -471,6 +500,56 @@ func TestUsageControlEvaluateActions(t *testing.T) {
 	}
 	if userA.TotalRequests == 0 {
 		t.Fatalf("expected userA requests > 0")
+	}
+}
+
+func TestUsageControlFixedCycleBoundaryReset(t *testing.T) {
+	t.Parallel()
+
+	anchor := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	window := int64(30 * 24 * 3600)
+
+	sinceBefore, err := usageWindowSince(anchor.Add(29*24*time.Hour+23*time.Hour+59*time.Minute), window, UsageControlWindowModeFixedCycle, &anchor)
+	if err != nil {
+		t.Fatalf("usageWindowSince before boundary: %v", err)
+	}
+	if !sinceBefore.Equal(anchor) {
+		t.Fatalf("sinceBefore=%s want=%s", sinceBefore.UTC().Format(time.RFC3339), anchor.UTC().Format(time.RFC3339))
+	}
+
+	after := anchor.Add(30*24*time.Hour + time.Minute)
+	sinceAfter, err := usageWindowSince(after, window, UsageControlWindowModeFixedCycle, &anchor)
+	if err != nil {
+		t.Fatalf("usageWindowSince after boundary: %v", err)
+	}
+	expectedAfter := anchor.Add(30 * 24 * time.Hour)
+	if !sinceAfter.Equal(expectedAfter) {
+		t.Fatalf("sinceAfter=%s want=%s", sinceAfter.UTC().Format(time.RFC3339), expectedAfter.UTC().Format(time.RFC3339))
+	}
+}
+
+func TestUsageControlFixedCycleWithinCycleAccumulates(t *testing.T) {
+	t.Parallel()
+
+	anchor := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	window := int64(30 * 24 * 3600)
+	now := anchor.Add(15 * 24 * time.Hour)
+
+	since, err := usageWindowSince(now, window, UsageControlWindowModeFixedCycle, &anchor)
+	if err != nil {
+		t.Fatalf("usageWindowSince same-cycle: %v", err)
+	}
+	if !since.Equal(anchor) {
+		t.Fatalf("same-cycle since=%s want=%s", since.UTC().Format(time.RFC3339), anchor.UTC().Format(time.RFC3339))
+	}
+
+	later := anchor.Add(15*24*time.Hour + 12*time.Hour)
+	sinceLater, err := usageWindowSince(later, window, UsageControlWindowModeFixedCycle, &anchor)
+	if err != nil {
+		t.Fatalf("usageWindowSince later same-cycle: %v", err)
+	}
+	if !sinceLater.Equal(anchor) {
+		t.Fatalf("later same-cycle since=%s want=%s", sinceLater.UTC().Format(time.RFC3339), anchor.UTC().Format(time.RFC3339))
 	}
 }
 

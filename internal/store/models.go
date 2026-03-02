@@ -46,6 +46,9 @@ const (
 	UsageControlActionDisableKey     = "disable_key"
 	UsageControlActionDisableUserKey = "disable_user_keys"
 	UsageControlActionDisableAllKeys = "disable_all_keys"
+
+	UsageControlWindowModeRolling    = "rolling"
+	UsageControlWindowModeFixedCycle = "fixed_cycle"
 )
 
 // APIKey represents a managed inbound API key metadata row.
@@ -92,19 +95,19 @@ type UsageSnapshot struct {
 
 // APIUsageSummary is an aggregated view for operator queries.
 type APIUsageSummary struct {
-	APIKey         string
-	TotalRequests  int64
-	FailedRequests int64
-	TotalTokens    int64
+	APIKey         string `json:"api_key"`
+	TotalRequests  int64  `json:"total_requests"`
+	FailedRequests int64  `json:"failed_requests"`
+	TotalTokens    int64  `json:"total_tokens"`
 }
 
 // UserUsageSummary is an aggregated usage view by owner email.
 type UserUsageSummary struct {
-	Email          string
-	Keys           []string
-	TotalRequests  int64
-	FailedRequests int64
-	TotalTokens    int64
+	Email          string   `json:"email"`
+	Keys           []string `json:"keys"`
+	TotalRequests  int64    `json:"total_requests"`
+	FailedRequests int64    `json:"failed_requests"`
+	TotalTokens    int64    `json:"total_tokens"`
 }
 
 // AccountSummary is a user-facing account view keyed by email.
@@ -219,19 +222,21 @@ type PlanCatalogItem struct {
 
 // UsageControl defines usage-limit actions for global/user/key scope.
 type UsageControl struct {
-	ID            int64
-	ScopeType     string
-	ScopeValue    string
-	WindowSeconds int64
-	MaxRequests   *int64
-	MaxTokens     *int64
-	Action        string
-	Enabled       bool
-	Note          string
-	CreatedBy     string
-	UpdatedBy     string
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
+	ID            int64      `json:"id"`
+	ScopeType     string     `json:"scope_type"`
+	ScopeValue    string     `json:"scope_value"`
+	WindowSeconds int64      `json:"window_seconds"`
+	WindowMode    string     `json:"window_mode"`
+	CycleAnchorAt *time.Time `json:"cycle_anchor_at,omitempty"`
+	MaxRequests   *int64     `json:"max_requests,omitempty"`
+	MaxTokens     *int64     `json:"max_tokens,omitempty"`
+	Action        string     `json:"action"`
+	Enabled       bool       `json:"enabled"`
+	Note          string     `json:"note"`
+	CreatedBy     string     `json:"created_by"`
+	UpdatedBy     string     `json:"updated_by"`
+	CreatedAt     time.Time  `json:"created_at"`
+	UpdatedAt     time.Time  `json:"updated_at"`
 }
 
 // UsageControlEvent records each evaluation result and action execution.
@@ -254,14 +259,14 @@ type UsageControlEvent struct {
 
 // UsageControlEvaluationResult is returned after evaluating controls.
 type UsageControlEvaluationResult struct {
-	ControlID     int64
-	ScopeType     string
-	ScopeValue    string
-	WindowSeconds int64
-	UsedRequests  int64
-	UsedTokens    int64
-	Action        string
-	Triggered     bool
-	Result        string
-	ErrorMessage  string
+	ControlID     int64  `json:"control_id"`
+	ScopeType     string `json:"scope_type"`
+	ScopeValue    string `json:"scope_value"`
+	WindowSeconds int64  `json:"window_seconds"`
+	UsedRequests  int64  `json:"used_requests"`
+	UsedTokens    int64  `json:"used_tokens"`
+	Action        string `json:"action"`
+	Triggered     bool   `json:"triggered"`
+	Result        string `json:"result"`
+	ErrorMessage  string `json:"error_message"`
 }

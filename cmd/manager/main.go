@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -1116,15 +1117,55 @@ func buildHTTPServer(cfg cfgpkg.Config, s *store.Store, reconciler *reconcile.Ma
 			totalFailed += item.FailedRequests
 			totalTokens += item.TotalTokens
 		}
-		topKeys, err := s.UsageTopSince(r.Context(), since, 20)
+		topKeys := allKeys
+		if len(topKeys) > 20 {
+			topKeys = topKeys[:20]
+		}
+		apiKeys, err := s.ListAPIKeys(r.Context())
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 			return
 		}
-		topUsers, err := s.UsageUsersSince(r.Context(), since, 20)
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-			return
+		ownerByKey := make(map[string]string, len(apiKeys))
+		for _, key := range apiKeys {
+			normalized := strings.TrimSpace(strings.ToLower(key.OwnerEmail))
+			if normalized == "" {
+				continue
+			}
+			ownerByKey[key.Key] = normalized
+		}
+		byUser := make(map[string]*store.UserUsageSummary)
+		for _, item := range allKeys {
+			email := ownerByKey[item.APIKey]
+			if email == "" {
+				email = "[unassigned]"
+			}
+			entry, ok := byUser[email]
+			if !ok {
+				entry = &store.UserUsageSummary{Email: email, Keys: make([]string, 0, 4)}
+				byUser[email] = entry
+			}
+			entry.TotalRequests += item.TotalRequests
+			entry.FailedRequests += item.FailedRequests
+			entry.TotalTokens += item.TotalTokens
+			entry.Keys = append(entry.Keys, item.APIKey)
+		}
+		topUsers := make([]store.UserUsageSummary, 0, len(byUser))
+		for _, entry := range byUser {
+			sort.Strings(entry.Keys)
+			topUsers = append(topUsers, *entry)
+		}
+		sort.Slice(topUsers, func(i, j int) bool {
+			if topUsers[i].TotalRequests == topUsers[j].TotalRequests {
+				if topUsers[i].TotalTokens == topUsers[j].TotalTokens {
+					return topUsers[i].Email < topUsers[j].Email
+				}
+				return topUsers[i].TotalTokens > topUsers[j].TotalTokens
+			}
+			return topUsers[i].TotalRequests > topUsers[j].TotalRequests
+		})
+		if len(topUsers) > 20 {
+			topUsers = topUsers[:20]
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
 			"since": since,

@@ -90,8 +90,10 @@ func (s *Store) Close() error {
 }
 
 func (s *Store) migrate(ctx context.Context) error {
+	synchronousMode := sqliteSynchronousMode()
 	queries := []string{
 		`PRAGMA journal_mode=WAL;`,
+		fmt.Sprintf(`PRAGMA synchronous=%s;`, synchronousMode),
 		`CREATE TABLE IF NOT EXISTS api_keys (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			api_key TEXT NOT NULL UNIQUE,
@@ -249,6 +251,8 @@ func (s *Store) migrate(ctx context.Context) error {
 			scope_type TEXT NOT NULL,
 			scope_value TEXT NOT NULL DEFAULT '',
 			window_seconds INTEGER NOT NULL,
+			window_mode TEXT NOT NULL DEFAULT 'rolling',
+			cycle_anchor_at DATETIME NULL,
 			max_requests INTEGER NULL,
 			max_tokens INTEGER NULL,
 			action TEXT NOT NULL,
@@ -259,6 +263,8 @@ func (s *Store) migrate(ctx context.Context) error {
 			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 			updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 		);`,
+		`ALTER TABLE usage_controls ADD COLUMN window_mode TEXT NOT NULL DEFAULT 'rolling';`,
+		`ALTER TABLE usage_controls ADD COLUMN cycle_anchor_at DATETIME NULL;`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_controls_scope_enabled ON usage_controls(scope_type, scope_value, enabled);`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_controls_enabled ON usage_controls(enabled);`,
 		`CREATE TABLE IF NOT EXISTS usage_control_events (
@@ -528,7 +534,19 @@ func (s *Store) SaveUsageSnapshot(ctx context.Context, payload []byte, exportedA
 	if err != nil {
 		return false, "", fmt.Errorf("hash usage snapshot payload: %w", err)
 	}
-	res, err := s.db.ExecContext(ctx, `
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, "", fmt.Errorf("begin usage snapshot tx: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	res, err := tx.ExecContext(ctx, `
 		INSERT INTO usage_snapshots(snapshot_hash, exported_at, payload_json)
 		VALUES (?, ?, ?)
 		ON CONFLICT(snapshot_hash) DO NOTHING
@@ -539,16 +557,40 @@ func (s *Store) SaveUsageSnapshot(ctx context.Context, payload []byte, exportedA
 	rows, _ := res.RowsAffected()
 	inserted := rows > 0
 
-	state, err := s.GetSyncState(ctx)
-	if err != nil {
-		return false, "", err
+	var lastUsageSnapshotHash string
+	if err := tx.QueryRowContext(ctx, `
+		SELECT last_usage_snapshot_hash
+		FROM sync_state
+		WHERE id = 1
+		LIMIT 1
+	`).Scan(&lastUsageSnapshotHash); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, "", fmt.Errorf("sync_state row is missing")
+		}
+		return false, "", fmt.Errorf("query sync state usage snapshot: %w", err)
 	}
-	if state.LastUsageSnapshotHash != usageHash {
+	if strings.TrimSpace(lastUsageSnapshotHash) != usageHash {
 		now := time.Now().UTC()
-		if err := s.UpdateSyncStateUsageSnapshot(ctx, usageHash, &exportedAt, &now); err != nil {
-			return false, "", err
+		updateRes, err := tx.ExecContext(ctx, `
+			UPDATE sync_state
+			SET last_usage_snapshot_hash = ?,
+			    last_usage_snapshot_at = ?,
+			    updated_at = ?
+			WHERE id = 1
+		`, usageHash, toNullTime(&exportedAt), now)
+		if err != nil {
+			return false, "", fmt.Errorf("update sync state usage snapshot: %w", err)
+		}
+		affected, _ := updateRes.RowsAffected()
+		if affected == 0 {
+			return false, "", fmt.Errorf("sync_state row is missing")
 		}
 	}
+
+	if err := tx.Commit(); err != nil {
+		return false, "", fmt.Errorf("commit usage snapshot tx: %w", err)
+	}
+	committed = true
 	return inserted, usageHash, nil
 }
 
@@ -1764,6 +1806,84 @@ func (s *Store) ListPlanCatalog(ctx context.Context, enabledOnly bool) ([]PlanCa
 	return items, nil
 }
 
+func (s *Store) UpsertPlanCatalogItem(ctx context.Context, item PlanCatalogItem) (*PlanCatalogItem, error) {
+	normalized, err := normalizePlanCatalogInput(item)
+	if err != nil {
+		return nil, err
+	}
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO plan_catalog(
+			id,
+			name,
+			persona,
+			billing_cycle,
+			monthly_price_suggestion,
+			included_tokens_total,
+			included_requests_total,
+			overage_price_suggestion,
+			usage_control_action,
+			recommended,
+			enabled,
+			display_order,
+			description
+		)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			name = excluded.name,
+			persona = excluded.persona,
+			billing_cycle = excluded.billing_cycle,
+			monthly_price_suggestion = excluded.monthly_price_suggestion,
+			included_tokens_total = excluded.included_tokens_total,
+			included_requests_total = excluded.included_requests_total,
+			overage_price_suggestion = excluded.overage_price_suggestion,
+			usage_control_action = excluded.usage_control_action,
+			recommended = excluded.recommended,
+			display_order = excluded.display_order,
+			description = excluded.description,
+			updated_at = CURRENT_TIMESTAMP
+	`,
+		normalized.ID,
+		normalized.Name,
+		normalized.Persona,
+		normalized.BillingCycle,
+		normalized.MonthlyPriceSuggestion,
+		normalized.IncludedTokensTotal,
+		toNullInt64(normalized.IncludedRequestsTotal),
+		normalized.OveragePriceSuggestion,
+		normalized.UsageControlAction,
+		boolToInt(normalized.Recommended),
+		boolToInt(normalized.Enabled),
+		normalized.DisplayOrder,
+		normalized.Description,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("upsert plan catalog item: %w", err)
+	}
+	return s.GetPlanCatalogByID(ctx, normalized.ID)
+}
+
+func (s *Store) SetPlanCatalogEnabled(ctx context.Context, id string, enabled bool, actor string) (bool, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return false, errors.New("plan id is required")
+	}
+	actor = strings.TrimSpace(actor)
+	if actor == "" {
+		actor = "system"
+	}
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE plan_catalog
+		SET enabled = ?,
+		    updated_at = CURRENT_TIMESTAMP
+		WHERE id = ?
+	`, boolToInt(enabled), id)
+	if err != nil {
+		return false, fmt.Errorf("set plan catalog enabled: %w", err)
+	}
+	affected, _ := res.RowsAffected()
+	return affected > 0, nil
+}
+
 func (s *Store) GetPlanCatalogByID(ctx context.Context, id string) (*PlanCatalogItem, error) {
 	id = strings.TrimSpace(id)
 	if id == "" {
@@ -1892,6 +2012,10 @@ func (s *Store) createPurchaseRequestWithProvisioning(ctx context.Context, reque
 	}
 
 	windowSeconds := int64(30 * 24 * 3600)
+	windowMode := UsageControlWindowModeRolling
+	if plan.BillingCycle == PlanBillingMonthly {
+		windowMode = UsageControlWindowModeFixedCycle
+	}
 	var maxRequests *int64
 	if plan.IncludedRequestsTotal != nil {
 		maxRequests = cloneInt64Ptr(plan.IncludedRequestsTotal)
@@ -1917,9 +2041,9 @@ func (s *Store) createPurchaseRequestWithProvisioning(ctx context.Context, reque
 		return nil, err
 	}
 	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO usage_controls(scope_type, scope_value, window_seconds, max_requests, max_tokens, action, enabled, note, created_by, updated_by)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, scopeType, scopeValue, normalizedWindow, toNullInt64(normalizedMaxRequests), toNullInt64(normalizedMaxTokens), action, 1, fmt.Sprintf("auto from purchase_request_id=%d plan_id=%s", requestID, plan.ID), createdBy, createdBy); err != nil {
+		INSERT INTO usage_controls(scope_type, scope_value, window_seconds, window_mode, cycle_anchor_at, max_requests, max_tokens, action, enabled, note, created_by, updated_by)
+		VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)
+	`, scopeType, scopeValue, normalizedWindow, windowMode, toNullInt64(normalizedMaxRequests), toNullInt64(normalizedMaxTokens), action, 1, fmt.Sprintf("auto from purchase_request_id=%d plan_id=%s", requestID, plan.ID), createdBy, createdBy); err != nil {
 		if _, markErr := tx.ExecContext(ctx, `
 			UPDATE purchase_requests
 			SET provisioning_status = ?,
@@ -2076,6 +2200,7 @@ func (s *Store) UpdatePurchaseRequestStatus(ctx context.Context, id int64, statu
 		reviewedAt = sql.NullTime{Time: now, Valid: true}
 		reviewedAtValue = now
 	}
+	activationAt := time.Now().UTC()
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE purchase_requests
 		SET status = ?,
@@ -2089,6 +2214,17 @@ func (s *Store) UpdatePurchaseRequestStatus(ctx context.Context, id int64, statu
 	}
 
 	if status == PurchaseRequestStatusApproved {
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE usage_controls
+			SET cycle_anchor_at = ?,
+			    updated_at = CURRENT_TIMESTAMP
+			WHERE window_mode = ?
+			  AND cycle_anchor_at IS NULL
+			  AND scope_type = ?
+			  AND note LIKE ?
+		`, reviewedAtValue, UsageControlWindowModeFixedCycle, UsageControlScopeKey, fmt.Sprintf("auto from purchase_request_id=%d%%", id)); err != nil {
+			return nil, fmt.Errorf("set usage control cycle anchor by purchase request: %w", err)
+		}
 		key := strings.TrimSpace(current.ProvisionedAPIKey)
 		if key == "" {
 			if _, err := tx.ExecContext(ctx, `
@@ -2097,7 +2233,7 @@ func (s *Store) UpdatePurchaseRequestStatus(ctx context.Context, id int64, statu
 				    activation_attempted_at = ?,
 				    updated_at = CURRENT_TIMESTAMP
 				WHERE id = ?
-			`, PurchaseRequestProvisioningFailed, time.Now().UTC(), id); err != nil {
+			`, PurchaseRequestProvisioningFailed, activationAt, id); err != nil {
 				return nil, fmt.Errorf("mark purchase request activation failed: %w", err)
 			}
 			return nil, errors.New("purchase request has no provisioned api key")
@@ -2119,7 +2255,7 @@ func (s *Store) UpdatePurchaseRequestStatus(ctx context.Context, id int64, statu
 				    activation_attempted_at = ?,
 				    updated_at = CURRENT_TIMESTAMP
 				WHERE id = ?
-			`, PurchaseRequestProvisioningFailed, time.Now().UTC(), id); err != nil {
+			`, PurchaseRequestProvisioningFailed, activationAt, id); err != nil {
 				return nil, fmt.Errorf("mark purchase request activation missing key: %w", err)
 			}
 			return nil, errors.New("provisioned api key not found")
@@ -2130,7 +2266,7 @@ func (s *Store) UpdatePurchaseRequestStatus(ctx context.Context, id int64, statu
 			    activation_attempted_at = ?,
 			    updated_at = CURRENT_TIMESTAMP
 			WHERE id = ?
-		`, PurchaseRequestProvisioningReady, time.Now().UTC(), id); err != nil {
+		`, PurchaseRequestProvisioningReady, activationAt, id); err != nil {
 			return nil, fmt.Errorf("update purchase activation metadata: %w", err)
 		}
 	} else if status == PurchaseRequestStatusRejected || status == PurchaseRequestStatusCancelled {
@@ -2247,7 +2383,15 @@ func (s *Store) ListUsers(ctx context.Context, role, status, q string, limit int
 }
 
 func (s *Store) CreateUsageControl(ctx context.Context, scopeType, scopeValue string, windowSeconds int64, maxRequests, maxTokens *int64, action string, enabled bool, note, actor string) (*UsageControl, error) {
+	return s.createUsageControlWithWindowConfig(ctx, scopeType, scopeValue, windowSeconds, UsageControlWindowModeRolling, nil, maxRequests, maxTokens, action, enabled, note, actor)
+}
+
+func (s *Store) createUsageControlWithWindowConfig(ctx context.Context, scopeType, scopeValue string, windowSeconds int64, windowMode string, cycleAnchorAt *time.Time, maxRequests, maxTokens *int64, action string, enabled bool, note, actor string) (*UsageControl, error) {
 	scopeType, scopeValue, windowSeconds, maxRequests, maxTokens, action, err := normalizeUsageControlInput(scopeType, scopeValue, windowSeconds, maxRequests, maxTokens, action)
+	if err != nil {
+		return nil, err
+	}
+	windowMode, cycleAnchor, err := normalizeUsageControlWindow(windowMode, cycleAnchorAt)
 	if err != nil {
 		return nil, err
 	}
@@ -2258,9 +2402,9 @@ func (s *Store) CreateUsageControl(ctx context.Context, scopeType, scopeValue st
 	}
 
 	res, err := s.db.ExecContext(ctx, `
-		INSERT INTO usage_controls(scope_type, scope_value, window_seconds, max_requests, max_tokens, action, enabled, note, created_by, updated_by)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, scopeType, scopeValue, windowSeconds, toNullInt64(maxRequests), toNullInt64(maxTokens), action, boolToInt(enabled), note, actor, actor)
+		INSERT INTO usage_controls(scope_type, scope_value, window_seconds, window_mode, cycle_anchor_at, max_requests, max_tokens, action, enabled, note, created_by, updated_by)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, scopeType, scopeValue, windowSeconds, windowMode, toNullTime(cycleAnchor), toNullInt64(maxRequests), toNullInt64(maxTokens), action, boolToInt(enabled), note, actor, actor)
 	if err != nil {
 		return nil, fmt.Errorf("create usage control: %w", err)
 	}
@@ -2314,12 +2458,13 @@ func (s *Store) GetUsageControlByID(ctx context.Context, id int64) (*UsageContro
 		return nil, errors.New("id is required")
 	}
 	row := s.db.QueryRowContext(ctx, `
-		SELECT id, scope_type, scope_value, window_seconds, max_requests, max_tokens, action, enabled, note, created_by, updated_by, created_at, updated_at
+		SELECT id, scope_type, scope_value, window_seconds, window_mode, cycle_anchor_at, max_requests, max_tokens, action, enabled, note, created_by, updated_by, created_at, updated_at
 		FROM usage_controls
 		WHERE id = ?
 		LIMIT 1
 	`, id)
 	var item UsageControl
+	var cycleAnchor sql.NullTime
 	var maxRequests, maxTokens sql.NullInt64
 	var enabled int64
 	if err := row.Scan(
@@ -2327,6 +2472,8 @@ func (s *Store) GetUsageControlByID(ctx context.Context, id int64) (*UsageContro
 		&item.ScopeType,
 		&item.ScopeValue,
 		&item.WindowSeconds,
+		&item.WindowMode,
+		&cycleAnchor,
 		&maxRequests,
 		&maxTokens,
 		&item.Action,
@@ -2344,8 +2491,16 @@ func (s *Store) GetUsageControlByID(ctx context.Context, id int64) (*UsageContro
 	}
 	item.ScopeType = strings.ToLower(strings.TrimSpace(item.ScopeType))
 	item.ScopeValue = strings.TrimSpace(item.ScopeValue)
+	item.WindowMode = strings.ToLower(strings.TrimSpace(item.WindowMode))
+	if item.WindowMode == "" {
+		item.WindowMode = UsageControlWindowModeRolling
+	}
 	item.Action = strings.ToLower(strings.TrimSpace(item.Action))
 	item.Enabled = enabled != 0
+	if cycleAnchor.Valid {
+		t := cycleAnchor.Time.UTC()
+		item.CycleAnchorAt = &t
+	}
 	item.MaxRequests = toInt64Ptr(maxRequests)
 	item.MaxTokens = toInt64Ptr(maxTokens)
 	item.Note = strings.TrimSpace(item.Note)
@@ -2358,7 +2513,7 @@ func (s *Store) GetUsageControlByID(ctx context.Context, id int64) (*UsageContro
 
 func (s *Store) ListUsageControls(ctx context.Context, enabledOnly bool) ([]UsageControl, error) {
 	query := `
-		SELECT id, scope_type, scope_value, window_seconds, max_requests, max_tokens, action, enabled, note, created_by, updated_by, created_at, updated_at
+		SELECT id, scope_type, scope_value, window_seconds, window_mode, cycle_anchor_at, max_requests, max_tokens, action, enabled, note, created_by, updated_by, created_at, updated_at
 		FROM usage_controls
 	`
 	args := make([]any, 0, 1)
@@ -2376,6 +2531,7 @@ func (s *Store) ListUsageControls(ctx context.Context, enabledOnly bool) ([]Usag
 	items := make([]UsageControl, 0)
 	for rows.Next() {
 		var item UsageControl
+		var cycleAnchor sql.NullTime
 		var maxRequests, maxTokens sql.NullInt64
 		var enabled int64
 		if err := rows.Scan(
@@ -2383,6 +2539,8 @@ func (s *Store) ListUsageControls(ctx context.Context, enabledOnly bool) ([]Usag
 			&item.ScopeType,
 			&item.ScopeValue,
 			&item.WindowSeconds,
+			&item.WindowMode,
+			&cycleAnchor,
 			&maxRequests,
 			&maxTokens,
 			&item.Action,
@@ -2397,8 +2555,16 @@ func (s *Store) ListUsageControls(ctx context.Context, enabledOnly bool) ([]Usag
 		}
 		item.ScopeType = strings.ToLower(strings.TrimSpace(item.ScopeType))
 		item.ScopeValue = strings.TrimSpace(item.ScopeValue)
+		item.WindowMode = strings.ToLower(strings.TrimSpace(item.WindowMode))
+		if item.WindowMode == "" {
+			item.WindowMode = UsageControlWindowModeRolling
+		}
 		item.Action = strings.ToLower(strings.TrimSpace(item.Action))
 		item.Enabled = enabled != 0
+		if cycleAnchor.Valid {
+			t := cycleAnchor.Time.UTC()
+			item.CycleAnchorAt = &t
+		}
 		item.MaxRequests = toInt64Ptr(maxRequests)
 		item.MaxTokens = toInt64Ptr(maxTokens)
 		item.Note = strings.TrimSpace(item.Note)
@@ -2516,6 +2682,12 @@ type usageWindowStats struct {
 	ByUser map[string]UserUsageSummary
 }
 
+type usageWindowKey struct {
+	WindowSeconds int64
+	WindowMode    string
+	SinceUnix     int64
+}
+
 func (s *Store) EvaluateUsageControls(ctx context.Context, now time.Time, actor string) ([]UsageControlEvaluationResult, bool, error) {
 	now = now.UTC()
 	actor = strings.TrimSpace(actor)
@@ -2534,7 +2706,7 @@ func (s *Store) EvaluateUsageControls(ctx context.Context, now time.Time, actor 
 	if err != nil {
 		return nil, false, err
 	}
-	windowCache := make(map[int64]*usageWindowStats)
+	windowCache := make(map[usageWindowKey]*usageWindowStats)
 	results := make([]UsageControlEvaluationResult, 0, len(controls))
 	keysChanged := false
 	var firstActionErr error
@@ -2544,14 +2716,22 @@ func (s *Store) EvaluateUsageControls(ctx context.Context, now time.Time, actor 
 		if window <= 0 {
 			continue
 		}
-		stats, ok := windowCache[window]
+		windowMode, cycleAnchor, err := normalizeUsageControlWindow(control.WindowMode, control.CycleAnchorAt)
+		if err != nil {
+			return nil, keysChanged, err
+		}
+		since, err := usageWindowSince(now, window, windowMode, cycleAnchor)
+		if err != nil {
+			return nil, keysChanged, err
+		}
+		cacheKey := usageWindowKey{WindowSeconds: window, WindowMode: windowMode, SinceUnix: since.Unix()}
+		stats, ok := windowCache[cacheKey]
 		if !ok {
-			since := now.Add(-time.Duration(window) * time.Second)
 			stats, err = s.buildUsageWindowStats(ctx, since, ownerMap)
 			if err != nil {
 				return nil, keysChanged, err
 			}
-			windowCache[window] = stats
+			windowCache[cacheKey] = stats
 		}
 
 		usedReq := int64(0)
@@ -2898,6 +3078,107 @@ func normalizePlanBillingCycle(raw string) (string, error) {
 		return cycle, nil
 	default:
 		return "", errors.New("invalid plan billing cycle")
+	}
+}
+
+func normalizePlanCatalogInput(item PlanCatalogItem) (PlanCatalogItem, error) {
+	normalized := item
+	normalized.ID = strings.TrimSpace(normalized.ID)
+	normalized.Name = strings.TrimSpace(normalized.Name)
+	normalized.Persona = strings.ToLower(strings.TrimSpace(normalized.Persona))
+	normalized.BillingCycle = strings.ToLower(strings.TrimSpace(normalized.BillingCycle))
+	normalized.MonthlyPriceSuggestion = strings.TrimSpace(normalized.MonthlyPriceSuggestion)
+	normalized.OveragePriceSuggestion = strings.TrimSpace(normalized.OveragePriceSuggestion)
+	normalized.UsageControlAction = strings.ToLower(strings.TrimSpace(normalized.UsageControlAction))
+	normalized.Description = strings.TrimSpace(normalized.Description)
+	if normalized.ID == "" {
+		return PlanCatalogItem{}, errors.New("plan id is required")
+	}
+	if normalized.Name == "" {
+		return PlanCatalogItem{}, errors.New("plan name is required")
+	}
+	persona, err := normalizePlanPersona(normalized.Persona)
+	if err != nil {
+		return PlanCatalogItem{}, err
+	}
+	normalized.Persona = persona
+	billingCycle, err := normalizePlanBillingCycle(normalized.BillingCycle)
+	if err != nil {
+		return PlanCatalogItem{}, err
+	}
+	normalized.BillingCycle = billingCycle
+	if normalized.MonthlyPriceSuggestion == "" {
+		return PlanCatalogItem{}, errors.New("monthly_price_suggestion is required")
+	}
+	if normalized.OveragePriceSuggestion == "" {
+		return PlanCatalogItem{}, errors.New("overage_price_suggestion is required")
+	}
+	if normalized.IncludedTokensTotal <= 0 {
+		return PlanCatalogItem{}, errors.New("included_tokens_total must be > 0")
+	}
+	if normalized.IncludedRequestsTotal != nil && *normalized.IncludedRequestsTotal <= 0 {
+		return PlanCatalogItem{}, errors.New("included_requests_total must be > 0")
+	}
+	action, err := normalizeUsageControlAction(normalized.UsageControlAction)
+	if err != nil {
+		return PlanCatalogItem{}, err
+	}
+	normalized.UsageControlAction = action
+	return normalized, nil
+}
+
+func sqliteSynchronousMode() string {
+	mode := strings.ToUpper(strings.TrimSpace(os.Getenv("APIM_SQLITE_SYNCHRONOUS")))
+	switch mode {
+	case "", "NORMAL":
+		return "NORMAL"
+	case "OFF", "FULL", "EXTRA":
+		return mode
+	default:
+		return "NORMAL"
+	}
+}
+
+func usageWindowSince(now time.Time, windowSeconds int64, windowMode string, cycleAnchorAt *time.Time) (time.Time, error) {
+	now = now.UTC()
+	if windowSeconds <= 0 {
+		return time.Time{}, errors.New("window_seconds must be > 0")
+	}
+	mode, anchor, err := normalizeUsageControlWindow(windowMode, cycleAnchorAt)
+	if err != nil {
+		return time.Time{}, err
+	}
+	if mode == UsageControlWindowModeRolling {
+		return now.Add(-time.Duration(windowSeconds) * time.Second), nil
+	}
+	if anchor == nil {
+		return now.Add(-time.Duration(windowSeconds) * time.Second), nil
+	}
+	if now.Before(*anchor) {
+		return *anchor, nil
+	}
+	windowDuration := time.Duration(windowSeconds) * time.Second
+	elapsed := now.Sub(*anchor)
+	cycles := int64(elapsed / windowDuration)
+	return anchor.Add(time.Duration(cycles) * windowDuration), nil
+}
+
+func normalizeUsageControlWindow(windowMode string, cycleAnchorAt *time.Time) (string, *time.Time, error) {
+	mode := strings.ToLower(strings.TrimSpace(windowMode))
+	if mode == "" {
+		mode = UsageControlWindowModeRolling
+	}
+	switch mode {
+	case UsageControlWindowModeRolling:
+		return mode, nil, nil
+	case UsageControlWindowModeFixedCycle:
+		if cycleAnchorAt == nil {
+			return mode, nil, nil
+		}
+		anchor := cycleAnchorAt.UTC()
+		return mode, &anchor, nil
+	default:
+		return "", nil, errors.New("invalid usage control window mode")
 	}
 }
 

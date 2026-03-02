@@ -71,3 +71,44 @@ CREATE TABLE IF NOT EXISTS purchase_requests (
 
 CREATE INDEX IF NOT EXISTS idx_purchase_requests_status_created_at ON purchase_requests(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_purchase_requests_requester_email_created_at ON purchase_requests(requester_email, created_at);
+
+CREATE TABLE IF NOT EXISTS usage_controls (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    scope_type TEXT NOT NULL,
+    scope_value TEXT NOT NULL DEFAULT '',
+    window_seconds INTEGER NOT NULL,
+    window_mode TEXT NOT NULL DEFAULT 'rolling',
+    cycle_anchor_at DATETIME NULL,
+    max_requests INTEGER NULL,
+    max_tokens INTEGER NULL,
+    action TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    note TEXT NOT NULL DEFAULT '',
+    created_by TEXT NOT NULL DEFAULT '',
+    updated_by TEXT NOT NULL DEFAULT '',
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_usage_controls_scope_enabled ON usage_controls(scope_type, scope_value, enabled);
+CREATE INDEX IF NOT EXISTS idx_usage_controls_enabled ON usage_controls(enabled);
+
+CREATE TABLE IF NOT EXISTS usage_control_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    control_id INTEGER NOT NULL,
+    scope_type TEXT NOT NULL,
+    scope_value TEXT NOT NULL DEFAULT '',
+    window_seconds INTEGER NOT NULL,
+    used_requests INTEGER NOT NULL DEFAULT 0,
+    used_tokens INTEGER NOT NULL DEFAULT 0,
+    threshold_requests INTEGER NULL,
+    threshold_tokens INTEGER NULL,
+    action TEXT NOT NULL,
+    triggered INTEGER NOT NULL DEFAULT 0,
+    result TEXT NOT NULL DEFAULT '',
+    error_message TEXT NOT NULL DEFAULT '',
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_usage_control_events_control_created ON usage_control_events(control_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_usage_control_events_created ON usage_control_events(created_at);

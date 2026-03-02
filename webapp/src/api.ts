@@ -8,6 +8,7 @@ import type {
   UsageControl,
   UsageOverview,
   UserUsageResponse,
+  AdminKeyItem,
 } from './types'
 
 const TOKEN_KEY = 'apim.web.token'
@@ -246,5 +247,29 @@ export async function createUsageControl(payload: any) {
 export async function evaluateUsageControlsNow() {
   return api<{ results: any[]; keys_synced: boolean }>('/api/v1/admin/usage-controls/evaluate-now', {
     method: 'POST',
+  })
+}
+
+export async function listAdminKeys(filter = 'all') {
+  return api<{ items: AdminKeyItem[] }>(`/api/v1/admin/keys?filter=${encodeURIComponent(filter)}`)
+}
+
+export async function updateAdminKeyStatus(key: string, status: 'active' | 'disabled') {
+  return api<{ ok: boolean }>('/api/v1/admin/keys/status', {
+    method: 'PATCH',
+    body: JSON.stringify({ key, status }),
+  })
+}
+
+export async function updateAdminKeyExpiry(key: string, expiresAtISO: string) {
+  return api<{ ok: boolean }>('/api/v1/admin/keys/expiry', {
+    method: 'PATCH',
+    body: JSON.stringify({ key, expires_at: expiresAtISO }),
+  })
+}
+
+export async function deleteAdminKey(key: string) {
+  return api<{ ok: boolean }>(`/api/v1/admin/keys?key=${encodeURIComponent(key)}`, {
+    method: 'DELETE',
   })
 }

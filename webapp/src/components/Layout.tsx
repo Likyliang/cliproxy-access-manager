@@ -28,6 +28,7 @@ export function AppLayout({ title, role, children }: Props) {
             <Link to="/admin/purchases">审批队列</Link>
             <Link to="/admin/users">用户列表</Link>
             <Link to="/admin/usage-controls">配额控制</Link>
+            <Link to="/admin/keys">Keys 管理</Link>
             <Link to="/admin/plans">套餐目录</Link>
           </nav>
         )}

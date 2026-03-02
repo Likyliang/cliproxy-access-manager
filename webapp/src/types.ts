@@ -140,9 +140,25 @@ export type UsageControl = {
   scope_type: string
   scope_value: string
   window_seconds: number
+  window_mode?: 'rolling' | 'fixed_cycle' | string
+  cycle_anchor_at?: string
   max_requests?: number
   max_tokens?: number
   action: string
   enabled: boolean
   note: string
+  created_by?: string
+  updated_by?: string
+  created_at?: string
+  updated_at?: string
+}
+
+export type AdminKeyItem = {
+  key: string
+  status: string
+  expires_at?: string
+  owner_email: string
+  plan_id?: string
+  note?: string
+  updated_at?: string
 }

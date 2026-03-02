@@ -563,3 +563,123 @@ func TestLegacyTokenPathStillWorks(t *testing.T) {
 		t.Fatalf("legacy token admin code=%d want=%d body=%s", adminRR.Code, http.StatusOK, adminRR.Body.String())
 	}
 }
+
+func TestAdminUsageControlAndOverviewSnakeCase(t *testing.T) {
+	t.Parallel()
+
+	dbPath := t.TempDir() + "/apim.db"
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer s.Close()
+
+	if err := s.UpsertIdentity(t.Context(), store.IdentityProviderHTTP, "admin-http-token", store.IdentityRoleAdmin, "admin@example.com", "", "test"); err != nil {
+		t.Fatalf("upsert admin identity: %v", err)
+	}
+	if err := s.UpsertAPIKey(t.Context(), "snake-key-1", nil, "snake@example.com", "", "tester"); err != nil {
+		t.Fatalf("upsert api key: %v", err)
+	}
+
+	now := time.Now().UTC()
+	payload := []byte(`{"version":1,"exported_at":"2026-01-01T00:00:00Z","usage":{"apis":{"snake-key-1":{"models":{"m1":{"details":[{"timestamp":"` + now.Format(time.RFC3339) + `","failed":false,"tokens":{"total_tokens":42}}]}}}}}}`)
+	if _, _, err := s.SaveUsageSnapshot(t.Context(), payload, now); err != nil {
+		t.Fatalf("save usage snapshot: %v", err)
+	}
+
+	maxReq := int64(1)
+	if _, err := s.CreateUsageControl(t.Context(), store.UsageControlScopeKey, "snake-key-1", 3600, &maxReq, nil, store.UsageControlActionAuditOnly, true, "snake-case", "tester"); err != nil {
+		t.Fatalf("create usage control: %v", err)
+	}
+
+	cfg := cfgpkg.Config{HTTPAddr: "127.0.0.1:0", HTTPAuthToken: "bootstrap", AuthSessionTTL: time.Hour, AuthCookieName: "apim_session"}
+	reconciler := reconcile.NewManager(s, nil, 0, 0, 0, true, "04:00", "/v0/management/latest-version", "", false, false, 10)
+	srv := buildHTTPServer(cfg, s, reconciler)
+
+	controlsReq := httptest.NewRequest(http.MethodGet, "/api/v1/admin/usage-controls", nil)
+	controlsReq.Header.Set("Authorization", "Bearer admin-http-token")
+	controlsRR := httptest.NewRecorder()
+	srv.Handler.ServeHTTP(controlsRR, controlsReq)
+	if controlsRR.Code != http.StatusOK {
+		t.Fatalf("/api/v1/admin/usage-controls code=%d want=%d body=%s", controlsRR.Code, http.StatusOK, controlsRR.Body.String())
+	}
+	var controlsResp struct {
+		Items []map[string]any `json:"items"`
+	}
+	if err := json.Unmarshal(controlsRR.Body.Bytes(), &controlsResp); err != nil {
+		t.Fatalf("decode usage controls: %v body=%s", err, controlsRR.Body.String())
+	}
+	if len(controlsResp.Items) == 0 {
+		t.Fatalf("expected usage controls items")
+	}
+	first := controlsResp.Items[0]
+	if _, ok := first["scope_type"]; !ok {
+		t.Fatalf("missing snake_case scope_type in item=%v", first)
+	}
+	if _, ok := first["window_seconds"]; !ok {
+		t.Fatalf("missing snake_case window_seconds in item=%v", first)
+	}
+	if _, ok := first["created_at"]; !ok {
+		t.Fatalf("missing snake_case created_at in item=%v", first)
+	}
+	if _, ok := first["ScopeType"]; ok {
+		t.Fatalf("unexpected PascalCase field ScopeType in item=%v", first)
+	}
+
+	evalReq := httptest.NewRequest(http.MethodPost, "/api/v1/admin/usage-controls/evaluate-now", nil)
+	evalReq.Header.Set("Authorization", "Bearer admin-http-token")
+	evalRR := httptest.NewRecorder()
+	srv.Handler.ServeHTTP(evalRR, evalReq)
+	if evalRR.Code != http.StatusOK && evalRR.Code != http.StatusBadGateway {
+		t.Fatalf("/api/v1/admin/usage-controls/evaluate-now code=%d want=%d or %d body=%s", evalRR.Code, http.StatusOK, http.StatusBadGateway, evalRR.Body.String())
+	}
+	var evalResp struct {
+		Results    []map[string]any `json:"results"`
+		KeysSynced *bool            `json:"keys_synced"`
+	}
+	if err := json.Unmarshal(evalRR.Body.Bytes(), &evalResp); err != nil {
+		t.Fatalf("decode evaluate-now: %v body=%s", err, evalRR.Body.String())
+	}
+	if evalResp.KeysSynced == nil {
+		t.Fatalf("expected keys_synced in evaluate-now response: %s", evalRR.Body.String())
+	}
+	if len(evalResp.Results) == 0 {
+		t.Fatalf("expected evaluate-now results")
+	}
+	if _, ok := evalResp.Results[0]["control_id"]; !ok {
+		t.Fatalf("expected snake_case control_id in result=%v", evalResp.Results[0])
+	}
+	if _, ok := evalResp.Results[0]["used_requests"]; !ok {
+		t.Fatalf("expected snake_case used_requests in result=%v", evalResp.Results[0])
+	}
+
+	overviewReq := httptest.NewRequest(http.MethodGet, "/api/v1/admin/usage/overview?since=24h", nil)
+	overviewReq.Header.Set("Authorization", "Bearer admin-http-token")
+	overviewRR := httptest.NewRecorder()
+	srv.Handler.ServeHTTP(overviewRR, overviewReq)
+	if overviewRR.Code != http.StatusOK {
+		t.Fatalf("/api/v1/admin/usage/overview code=%d want=%d body=%s", overviewRR.Code, http.StatusOK, overviewRR.Body.String())
+	}
+	var overviewResp struct {
+		TopUsers []map[string]any `json:"top_users"`
+		TopKeys  []map[string]any `json:"top_keys"`
+	}
+	if err := json.Unmarshal(overviewRR.Body.Bytes(), &overviewResp); err != nil {
+		t.Fatalf("decode usage overview: %v body=%s", err, overviewRR.Body.String())
+	}
+	if len(overviewResp.TopUsers) == 0 {
+		t.Fatalf("expected top_users entries")
+	}
+	if len(overviewResp.TopKeys) == 0 {
+		t.Fatalf("expected top_keys entries")
+	}
+	if _, ok := overviewResp.TopUsers[0]["total_requests"]; !ok {
+		t.Fatalf("expected snake_case total_requests in top_users[0]=%v", overviewResp.TopUsers[0])
+	}
+	if _, ok := overviewResp.TopUsers[0]["keys"]; !ok {
+		t.Fatalf("expected snake_case keys in top_users[0]=%v", overviewResp.TopUsers[0])
+	}
+	if _, ok := overviewResp.TopKeys[0]["api_key"]; !ok {
+		t.Fatalf("expected snake_case api_key in top_keys[0]=%v", overviewResp.TopKeys[0])
+	}
+}

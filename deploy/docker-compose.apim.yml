@@ -60,10 +60,16 @@ services:
       NO_PROXY: ${NO_PROXY:-127.0.0.1,localhost,host.docker.internal}
     volumes:
       - ./data:/data
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /home/lianghao/cliproxy-access-manager/deploy/tools/docker:/usr/local/bin/docker:ro
+      - /home/lianghao/cliproxy-access-manager/deploy/tools/docker-compose-plugin:/usr/local/libexec/docker/cli-plugins/docker-compose:ro
+      - /home/lianghao/docker-projects/CLIProxyAPI:/workspace/CLIProxyAPI
     ports:
       - "127.0.0.1:8390:8390"
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    group_add:
+      - "988"
     networks:
       - default
       - shared-proxy-network
