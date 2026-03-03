@@ -45,27 +45,49 @@ type Manager struct {
 	autoUpdateComposeFile     string
 	autoUpdateWorkingDir      string
 
-	updateMu sync.Mutex
-	wg       sync.WaitGroup
+	updateMu         sync.Mutex
+	updateApplyJobMu sync.Mutex
+	updateApplyJob   *UpdateApplyJob
+	wg               sync.WaitGroup
 }
 
 type Status struct {
-	Healthy              bool       `json:"healthy"`
-	LastKeySyncAt        *time.Time `json:"last_key_sync_at,omitempty"`
-	LastUsageSnapshotAt  *time.Time `json:"last_usage_snapshot_at,omitempty"`
-	LastRecoveryImportAt *time.Time `json:"last_recovery_import_at,omitempty"`
-	LastUpdateCheckAt    *time.Time `json:"last_update_check_at,omitempty"`
-	LastKeysHash         string     `json:"last_keys_hash,omitempty"`
-	LastSnapshotHash     string     `json:"last_snapshot_hash,omitempty"`
-	LastRecoveryHash     string     `json:"last_recovery_hash,omitempty"`
-	CurrentVersion       string     `json:"current_version,omitempty"`
-	LatestVersion        string     `json:"latest_version,omitempty"`
-	UpdateStatus         string     `json:"update_status,omitempty"`
-	UpdateMessage        string     `json:"update_message,omitempty"`
-	UpdateCheckTime      string     `json:"update_check_time,omitempty"`
-	UpdateApplyMode      string     `json:"update_apply_mode,omitempty"`
-	UpdateCommandSet     bool       `json:"update_command_set"`
-	Message              string     `json:"message,omitempty"`
+	Healthy               bool       `json:"healthy"`
+	LastKeySyncAt         *time.Time `json:"last_key_sync_at,omitempty"`
+	LastUsageSnapshotAt   *time.Time `json:"last_usage_snapshot_at,omitempty"`
+	LastRecoveryImportAt  *time.Time `json:"last_recovery_import_at,omitempty"`
+	LastUpdateCheckAt     *time.Time `json:"last_update_check_at,omitempty"`
+	LastKeysHash          string     `json:"last_keys_hash,omitempty"`
+	LastSnapshotHash      string     `json:"last_snapshot_hash,omitempty"`
+	LastRecoveryHash      string     `json:"last_recovery_hash,omitempty"`
+	CurrentVersion        string     `json:"current_version,omitempty"`
+	LatestVersion         string     `json:"latest_version,omitempty"`
+	UpdateStatus          string     `json:"update_status,omitempty"`
+	UpdateMessage         string     `json:"update_message,omitempty"`
+	UpdateCheckTime       string     `json:"update_check_time,omitempty"`
+	UpdateApplyMode       string     `json:"update_apply_mode,omitempty"`
+	UpdateApplyState      string     `json:"update_apply_state,omitempty"`
+	UpdateApplyJobID      string     `json:"update_apply_job_id,omitempty"`
+	UpdateApplyStartedAt  *time.Time `json:"update_apply_started_at,omitempty"`
+	UpdateApplyFinishedAt *time.Time `json:"update_apply_finished_at,omitempty"`
+	UpdateApplyError      string     `json:"update_apply_error,omitempty"`
+	UpdateCommandSet      bool       `json:"update_command_set"`
+	Message               string     `json:"message,omitempty"`
+}
+
+const (
+	UpdateApplyStateRunning   = "running"
+	UpdateApplyStateSucceeded = "succeeded"
+	UpdateApplyStateFailed    = "failed"
+)
+
+type UpdateApplyJob struct {
+	ID         string     `json:"id"`
+	State      string     `json:"state"`
+	StartedAt  time.Time  `json:"started_at"`
+	FinishedAt *time.Time `json:"finished_at,omitempty"`
+	Error      string     `json:"error,omitempty"`
+	Trigger    string     `json:"trigger,omitempty"`
 }
 
 func NewManager(s *store.Store, c *cliproxy.Client, keySyncInterval, usageSyncInterval, recoveryCheckInterval time.Duration, updateCheckEnabled bool, updateCheckTime, latestVersionEndpoint, updateApplyCommand string, updateAutoApplyEnabled, updateAllowCustomCommand bool, recoverySnapshotScanLimit int) *Manager {
@@ -523,6 +545,99 @@ func (m *Manager) ApplyMainProjectUpdateNow(ctx context.Context) error {
 	return m.applyUpdateFn(ctx)
 }
 
+func (m *Manager) StartMainProjectUpdateApply(ctx context.Context, trigger string) (UpdateApplyJob, bool, error) {
+	if m == nil {
+		return UpdateApplyJob{}, false, fmt.Errorf("nil manager")
+	}
+	trigger = strings.TrimSpace(strings.ToLower(trigger))
+	if trigger == "" {
+		trigger = "manual"
+	}
+	if trigger != "manual" && trigger != "auto" {
+		trigger = "manual"
+	}
+
+	m.updateApplyJobMu.Lock()
+	if m.updateApplyJob != nil && m.updateApplyJob.State == UpdateApplyStateRunning {
+		job := *m.updateApplyJob
+		m.updateApplyJobMu.Unlock()
+		return job, false, nil
+	}
+	now := time.Now().UTC()
+	job := &UpdateApplyJob{
+		ID:        fmt.Sprintf("update-apply-%d", now.UnixNano()),
+		State:     UpdateApplyStateRunning,
+		StartedAt: now,
+		Trigger:   trigger,
+	}
+	m.updateApplyJob = job
+	startedJob := *job
+	m.updateApplyJobMu.Unlock()
+
+	m.wg.Add(1)
+	go func(jobID string) {
+		defer m.wg.Done()
+		runCtx := context.WithoutCancel(ctx)
+		err := m.ApplyMainProjectUpdateNow(runCtx)
+		if err == nil {
+			if checkErr := m.CheckMainProjectUpdateNow(runCtx); checkErr != nil {
+				if m.store != nil {
+					_ = m.store.InsertAuditLog(runCtx, "reconciler", "main_project_update_apply_check_after_async_failed", checkErr.Error())
+				}
+			}
+		}
+		m.finishUpdateApplyJob(runCtx, jobID, err)
+	}(startedJob.ID)
+
+	return startedJob, true, nil
+}
+
+func (m *Manager) CurrentUpdateApplyJob() *UpdateApplyJob {
+	if m == nil {
+		return nil
+	}
+	m.updateApplyJobMu.Lock()
+	defer m.updateApplyJobMu.Unlock()
+	if m.updateApplyJob == nil {
+		return nil
+	}
+	job := *m.updateApplyJob
+	return &job
+}
+
+func (m *Manager) finishUpdateApplyJob(ctx context.Context, jobID string, applyErr error) {
+	if m == nil {
+		return
+	}
+	finishedAt := time.Now().UTC()
+	state := UpdateApplyStateSucceeded
+	errText := ""
+	if applyErr != nil {
+		state = UpdateApplyStateFailed
+		errText = applyErr.Error()
+	}
+
+	m.updateApplyJobMu.Lock()
+	var trigger string
+	if m.updateApplyJob != nil && m.updateApplyJob.ID == jobID {
+		m.updateApplyJob.State = state
+		m.updateApplyJob.FinishedAt = &finishedAt
+		m.updateApplyJob.Error = errText
+		trigger = m.updateApplyJob.Trigger
+	}
+	m.updateApplyJobMu.Unlock()
+
+	if m.store == nil {
+		return
+	}
+	detail := fmt.Sprintf("job_id=%s trigger=%s", jobID, trigger)
+	if state == UpdateApplyStateSucceeded {
+		_ = m.store.InsertAuditLog(ctx, "reconciler", "main_project_update_apply_async_succeeded", detail)
+		return
+	}
+	_ = m.store.InsertAuditLog(ctx, "reconciler", "main_project_update_apply_async_failed", detail+" error="+errText)
+}
+
 func (m *Manager) applyMainProjectUpdateNow(ctx context.Context) error {
 	if m.syncUsageSnapshotFn == nil {
 		return fmt.Errorf("sync usage snapshot function is not configured")
@@ -572,12 +687,15 @@ func (m *Manager) Status(ctx context.Context) (Status, error) {
 	if m == nil {
 		return Status{}, fmt.Errorf("nil manager")
 	}
-	if m.store == nil {
-		return Status{}, fmt.Errorf("nil store")
-	}
-	state, err := m.store.GetSyncState(ctx)
-	if err != nil {
-		return Status{}, err
+	var (
+		state store.SyncState
+		err   error
+	)
+	if m.store != nil {
+		state, err = m.store.GetSyncState(ctx)
+		if err != nil {
+			return Status{}, err
+		}
 	}
 	var healthErr error
 	if m.client != nil {
@@ -599,6 +717,14 @@ func (m *Manager) Status(ctx context.Context) (Status, error) {
 		UpdateCheckTime:      m.updateCheckTime,
 		UpdateApplyMode:      m.updateApplyMode(),
 		UpdateCommandSet:     strings.TrimSpace(m.updateApplyCommand) != "",
+	}
+	if updateJob := m.CurrentUpdateApplyJob(); updateJob != nil {
+		status.UpdateApplyState = updateJob.State
+		status.UpdateApplyJobID = updateJob.ID
+		startedAt := updateJob.StartedAt
+		status.UpdateApplyStartedAt = &startedAt
+		status.UpdateApplyFinishedAt = updateJob.FinishedAt
+		status.UpdateApplyError = updateJob.Error
 	}
 	if healthErr != nil {
 		status.Message = healthErr.Error()

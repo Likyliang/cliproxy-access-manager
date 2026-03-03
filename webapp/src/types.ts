@@ -106,6 +106,15 @@ export type UserUsageResponse = {
   }>
 }
 
+export type UpdateApplyJob = {
+  id: string
+  state: 'running' | 'succeeded' | 'failed' | string
+  started_at: string
+  finished_at?: string
+  error?: string
+  trigger?: 'manual' | 'auto' | string
+}
+
 export type ReconcilerStatus = {
   healthy: boolean
   last_key_sync_at?: string
@@ -121,6 +130,11 @@ export type ReconcilerStatus = {
   update_message?: string
   update_check_time?: string
   update_apply_mode?: string
+  update_apply_state?: 'running' | 'succeeded' | 'failed' | string
+  update_apply_job_id?: string
+  update_apply_started_at?: string
+  update_apply_finished_at?: string
+  update_apply_error?: string
   update_command_set?: boolean
   message?: string
 }

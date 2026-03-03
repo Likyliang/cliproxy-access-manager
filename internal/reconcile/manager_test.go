@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/plugins/cliproxy-access-manager/internal/store"
 )
@@ -216,5 +217,137 @@ func TestEvaluateUsageControlsNowNoChangeNoSync(t *testing.T) {
 	}
 	if calledSync != 0 {
 		t.Fatalf("sync called=%d want=0", calledSync)
+	}
+}
+
+func TestStartMainProjectUpdateApplyStateTransition(t *testing.T) {
+	t.Parallel()
+
+	m := &Manager{}
+
+	applyDone := make(chan struct{})
+	m.applyUpdateFn = func(context.Context) error {
+		close(applyDone)
+		return nil
+	}
+	m.updateCheckFn = func(context.Context) error { return nil }
+
+	job, accepted, err := m.StartMainProjectUpdateApply(context.Background(), "manual")
+	if err != nil {
+		t.Fatalf("StartMainProjectUpdateApply error: %v", err)
+	}
+	if !accepted {
+		t.Fatalf("accepted=%v want=true", accepted)
+	}
+	if strings.TrimSpace(job.ID) == "" {
+		t.Fatalf("job id is empty")
+	}
+	if job.State != UpdateApplyStateRunning {
+		t.Fatalf("job state=%s want=%s", job.State, UpdateApplyStateRunning)
+	}
+	if currentRunning := m.CurrentUpdateApplyJob(); currentRunning == nil || currentRunning.State != UpdateApplyStateRunning {
+		t.Fatalf("expected running state before completion, got=%+v", currentRunning)
+	}
+
+	select {
+	case <-applyDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting apply to complete")
+	}
+
+	m.Wait()
+
+	current := m.CurrentUpdateApplyJob()
+	if current == nil {
+		t.Fatalf("current update job should exist")
+	}
+	if current.State != UpdateApplyStateSucceeded {
+		t.Fatalf("final state=%s want=%s", current.State, UpdateApplyStateSucceeded)
+	}
+	if current.FinishedAt == nil {
+		t.Fatalf("finished_at should be set")
+	}
+	if current.Error != "" {
+		t.Fatalf("unexpected error: %s", current.Error)
+	}
+}
+
+func TestStartMainProjectUpdateApplySingleFlightReturnsSameJob(t *testing.T) {
+	t.Parallel()
+
+	m := &Manager{}
+
+	release := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	m.applyUpdateFn = func(context.Context) error {
+		entered <- struct{}{}
+		<-release
+		return nil
+	}
+	m.updateCheckFn = func(context.Context) error { return nil }
+
+	job1, accepted1, err := m.StartMainProjectUpdateApply(context.Background(), "manual")
+	if err != nil {
+		t.Fatalf("first StartMainProjectUpdateApply error: %v", err)
+	}
+	if !accepted1 {
+		t.Fatalf("first accepted=%v want=true", accepted1)
+	}
+
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting first apply to enter")
+	}
+
+	job2, accepted2, err := m.StartMainProjectUpdateApply(context.Background(), "manual")
+	if err != nil {
+		t.Fatalf("second StartMainProjectUpdateApply error: %v", err)
+	}
+	if accepted2 {
+		t.Fatalf("second accepted=%v want=false", accepted2)
+	}
+	if job2.ID != job1.ID {
+		t.Fatalf("job id mismatch second=%s first=%s", job2.ID, job1.ID)
+	}
+	if job2.State != UpdateApplyStateRunning {
+		t.Fatalf("second state=%s want=%s", job2.State, UpdateApplyStateRunning)
+	}
+
+	close(release)
+	m.Wait()
+}
+
+func TestStartMainProjectUpdateApplyFailureState(t *testing.T) {
+	t.Parallel()
+
+	m := &Manager{}
+	m.applyUpdateFn = func(context.Context) error {
+		return errors.New("apply failed for test")
+	}
+	m.updateCheckFn = func(context.Context) error { return nil }
+
+	_, accepted, err := m.StartMainProjectUpdateApply(context.Background(), "manual")
+	if err != nil {
+		t.Fatalf("StartMainProjectUpdateApply error: %v", err)
+	}
+	if !accepted {
+		t.Fatalf("accepted=%v want=true", accepted)
+	}
+
+	m.Wait()
+
+	current := m.CurrentUpdateApplyJob()
+	if current == nil {
+		t.Fatalf("current update job should exist")
+	}
+	if current.State != UpdateApplyStateFailed {
+		t.Fatalf("final state=%s want=%s", current.State, UpdateApplyStateFailed)
+	}
+	if current.FinishedAt == nil {
+		t.Fatalf("finished_at should be set")
+	}
+	if !strings.Contains(current.Error, "apply failed for test") {
+		t.Fatalf("error=%q should contain apply failure", current.Error)
 	}
 }

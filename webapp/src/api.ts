@@ -5,6 +5,7 @@ import type {
   Principal,
   PurchaseRequest,
   ReconcilerStatus,
+  UpdateApplyJob,
   UsageControl,
   UsageOverview,
   UserUsageResponse,
@@ -206,7 +207,7 @@ export async function checkMainProjectUpdate() {
 }
 
 export async function applyMainProjectUpdate() {
-  return api<{ ok: boolean; status?: ReconcilerStatus }>('/update/apply', {
+  return api<{ ok: boolean; accepted: boolean; job: UpdateApplyJob }>('/update/apply', {
     method: 'POST',
   })
 }

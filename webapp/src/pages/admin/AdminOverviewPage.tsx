@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { applyMainProjectUpdate, checkMainProjectUpdate, getReconcilerStatus, getUsageOverview } from '../../api'
 import type { ReconcilerStatus, UsageOverview } from '../../types'
 
@@ -9,7 +9,15 @@ export function AdminOverviewPage() {
   const [updateMsg, setUpdateMsg] = useState('')
   const [updateError, setUpdateError] = useState('')
   const [checkingUpdate, setCheckingUpdate] = useState(false)
-  const [applyingUpdate, setApplyingUpdate] = useState(false)
+  const [submittingUpdate, setSubmittingUpdate] = useState(false)
+  const updatePollTimerRef = useRef<number | null>(null)
+
+  const clearUpdatePoll = () => {
+    if (updatePollTimerRef.current != null) {
+      window.clearInterval(updatePollTimerRef.current)
+      updatePollTimerRef.current = null
+    }
+  }
 
   const loadOverview = () => getUsageOverview(since).then(setData)
   const loadStatus = () => getReconcilerStatus().then(setStatus)
@@ -24,7 +32,49 @@ export function AdminOverviewPage() {
     })
   }, [])
 
-  const canApplyUpdate = status?.update_status === 'update_available'
+  useEffect(() => {
+    if (status?.update_apply_state !== 'running') {
+      clearUpdatePoll()
+      return
+    }
+    if (updatePollTimerRef.current != null) {
+      return
+    }
+    const timer = window.setInterval(async () => {
+      try {
+        const nextStatus = await getReconcilerStatus()
+        setStatus(nextStatus)
+      } catch {
+        // ignore polling error and keep existing state
+      }
+    }, 2000)
+    updatePollTimerRef.current = timer
+    return () => {
+      window.clearInterval(timer)
+      if (updatePollTimerRef.current === timer) {
+        updatePollTimerRef.current = null
+      }
+    }
+  }, [status?.update_apply_state])
+
+  useEffect(() => {
+    if (status?.update_apply_state === 'succeeded') {
+      setUpdateMsg('更新任务执行成功')
+      setUpdateError('')
+    } else if (status?.update_apply_state === 'failed') {
+      setUpdateError(status.update_apply_error || '更新任务执行失败')
+      setUpdateMsg('')
+    }
+  }, [status?.update_apply_state, status?.update_apply_error])
+
+  useEffect(() => {
+    return () => {
+      clearUpdatePoll()
+    }
+  }, [])
+
+  const updateRunning = status?.update_apply_state === 'running'
+  const canApplyUpdate = status?.update_status === 'update_available' && !updateRunning
 
   const doCheckUpdate = async () => {
     setCheckingUpdate(true)
@@ -46,18 +96,22 @@ export function AdminOverviewPage() {
     if (!canApplyUpdate) return
     if (!window.confirm('确认执行更新吗？更新过程会触发后端自动更新流程。')) return
 
-    setApplyingUpdate(true)
+    setSubmittingUpdate(true)
     setUpdateError('')
     setUpdateMsg('')
     try {
       const res = await applyMainProjectUpdate()
-      const nextStatus = res.status || (await getReconcilerStatus())
+      const nextStatus = await getReconcilerStatus()
       setStatus(nextStatus)
-      setUpdateMsg(nextStatus.update_message || '更新命令已执行')
+      if (res.accepted) {
+        setUpdateMsg('更新任务已提交，正在后台执行...')
+      } else {
+        setUpdateMsg('已有更新任务正在执行，已复用现有任务')
+      }
     } catch (e: any) {
       setUpdateError(`执行更新失败: ${e?.message || 'unknown error'}`)
     } finally {
-      setApplyingUpdate(false)
+      setSubmittingUpdate(false)
     }
   }
 
@@ -68,17 +122,17 @@ export function AdminOverviewPage() {
       <div className="panel">
         <h2>主项目更新</h2>
         <div className="row">
-          <button onClick={doCheckUpdate} disabled={checkingUpdate || applyingUpdate}>
+          <button onClick={doCheckUpdate} disabled={checkingUpdate || submittingUpdate || updateRunning}>
             {checkingUpdate ? '检查中...' : '手动检查更新'}
           </button>
           <button
             className="secondary"
             onClick={doApplyUpdate}
-            disabled={!canApplyUpdate || checkingUpdate || applyingUpdate}
+            disabled={!canApplyUpdate || checkingUpdate || submittingUpdate || updateRunning}
           >
-            {applyingUpdate ? '更新中...' : '确认并更新'}
+            {updateRunning ? '更新进行中...' : submittingUpdate ? '提交中...' : '确认并更新'}
           </button>
-          <button className="secondary" onClick={() => loadStatus()} disabled={checkingUpdate || applyingUpdate}>
+          <button className="secondary" onClick={() => loadStatus()} disabled={checkingUpdate || submittingUpdate}>
             刷新状态
           </button>
         </div>
@@ -88,6 +142,8 @@ export function AdminOverviewPage() {
           <div>Current version: <code>{status?.current_version || '-'}</code></div>
           <div>Latest version: <code>{status?.latest_version || '-'}</code></div>
           <div>Last check: <code>{status?.last_update_check_at || '-'}</code></div>
+          <div>Apply state: <code>{status?.update_apply_state || '-'}</code></div>
+          <div>Apply job: <code>{status?.update_apply_job_id || '-'}</code></div>
         </div>
 
         {updateMsg ? <p className="msg">{updateMsg}</p> : null}

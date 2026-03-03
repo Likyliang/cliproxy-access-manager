@@ -76,6 +76,65 @@ func TestUpdateEndpointAuthWithToken(t *testing.T) {
 	}
 }
 
+func TestUpdateApplyEndpointReturnsAcceptedJob(t *testing.T) {
+	t.Parallel()
+
+	dbPath := t.TempDir() + "/apim.db"
+	s, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer s.Close()
+
+	if err := s.UpsertIdentity(t.Context(), store.IdentityProviderHTTP, "admin-http-token", store.IdentityRoleAdmin, "admin@example.com", "", "test"); err != nil {
+		t.Fatalf("upsert admin identity: %v", err)
+	}
+
+	cfg := cfgpkg.Config{HTTPAddr: "127.0.0.1:0", HTTPAuthToken: "bootstrap", AuthSessionTTL: time.Hour, AuthCookieName: "apim_session"}
+	reconciler := reconcile.NewManager(s, nil, 0, 0, 0, true, "04:00", "/v0/management/latest-version", "", false, false, 10)
+	srv := buildHTTPServer(cfg, s, reconciler)
+
+	req := httptest.NewRequest(http.MethodPost, "/update/apply", nil)
+	req.Header.Set("Authorization", "Bearer admin-http-token")
+	rr := httptest.NewRecorder()
+	srv.Handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("status=%d want=%d body=%s", rr.Code, http.StatusAccepted, rr.Body.String())
+	}
+
+	var body struct {
+		OK       bool `json:"ok"`
+		Accepted bool `json:"accepted"`
+		Job      struct {
+			ID        string `json:"id"`
+			State     string `json:"state"`
+			StartedAt string `json:"started_at"`
+			Trigger   string `json:"trigger"`
+		} `json:"job"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode body: %v body=%s", err, rr.Body.String())
+	}
+	if !body.OK {
+		t.Fatalf("ok=%v want=true", body.OK)
+	}
+	if !body.Accepted {
+		t.Fatalf("accepted=%v want=true", body.Accepted)
+	}
+	if strings.TrimSpace(body.Job.ID) == "" {
+		t.Fatalf("job.id is empty: %+v", body.Job)
+	}
+	if body.Job.State != reconcile.UpdateApplyStateRunning {
+		t.Fatalf("job.state=%q want=%q", body.Job.State, reconcile.UpdateApplyStateRunning)
+	}
+	if strings.TrimSpace(body.Job.StartedAt) == "" {
+		t.Fatalf("job.started_at is empty: %+v", body.Job)
+	}
+	if body.Job.Trigger != "manual" {
+		t.Fatalf("job.trigger=%q want=manual", body.Job.Trigger)
+	}
+}
+
 func TestRBACStatusAndMe(t *testing.T) {
 	t.Parallel()
 

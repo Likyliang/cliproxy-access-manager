@@ -324,16 +324,17 @@ func buildHTTPServer(cfg cfgpkg.Config, s *store.Store, reconciler *reconcile.Ma
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
 			return
 		}
-		if err := reconciler.ApplyMainProjectUpdateNow(r.Context()); err != nil {
+		job, accepted, err := reconciler.StartMainProjectUpdateApply(r.Context(), "manual")
+		if err != nil {
 			writeJSON(w, http.StatusBadGateway, map[string]any{"error": err.Error()})
 			return
 		}
-		if err := reconciler.CheckMainProjectUpdateNow(r.Context()); err != nil {
-			_ = s.InsertAuditLog(r.Context(), actor, "update_check_after_apply_failed", err.Error())
+		auditDetail := "manual trigger accepted=true"
+		if !accepted {
+			auditDetail = "manual trigger accepted=false reused_running_job"
 		}
-		_ = s.InsertAuditLog(r.Context(), actor, "update_apply_manual", "manual trigger")
-		status, _ := reconciler.Status(r.Context())
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "status": status})
+		_ = s.InsertAuditLog(r.Context(), actor, "update_apply_manual", auditDetail)
+		writeJSON(w, http.StatusAccepted, map[string]any{"ok": true, "accepted": accepted, "job": job})
 	}))
 
 	mux.HandleFunc("/sync_now", requireAdmin(func(w http.ResponseWriter, r *http.Request, principal *store.Principal) {
